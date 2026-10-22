@@ -1,0 +1,271 @@
+// 行为级独立次数上限测试：
+// 驱动真实 structured runtime wrapper（包入口同款 hardening + core 注册工具），验证用户显式开启的
+// 深挖次数上限只在工具真正产出证据后消费——ok:false 的“无可用证据”结果不烧配额；Core 的一次性
+// follow-up 不会重放，而 Hardening 会继续发出 evidence guard。成功消费最后一次额度后立即切到 stop
+// guard，随后调用命中 VISION_DEPTH_LIMIT。深度策略本身不提供次数上限。
+// 不 stub fetch：本地 OpenAI 兼容假服务驱动 bootstrap 与“无可用证据”调用；成功证据使用同一
+// hardening wrapper 下注册的确定性 vision_ground fixture，避免把 sharp/像素量化细节混进 quota 测试。
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { createServer } from 'node:http'
+import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import { apply } from '../index.js'
+import { Config } from '../entry.js'
+import { installStructuredFlowHardening } from '../lib/structured-flow-hardening.js'
+
+const PNG_BYTES = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+  'base64',
+)
+
+async function startFakeVisionServer(responder) {
+  const requests = []
+  const sockets = new Set()
+  const server = createServer(async (req, res) => {
+    const chunks = []
+    for await (const chunk of req) chunks.push(chunk)
+    let body = {}
+    try {
+      body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
+    } catch {
+      body = {}
+    }
+    requests.push({ url: req.url, body })
+    let out
+    try {
+      out = await responder(req, body, requests.length)
+    } catch {
+      if (res.writableEnded) return
+      out = { status: 500, body: 'responder error' }
+    }
+    if (res.writableEnded) return
+    res.writeHead(out.status ?? 200, { 'content-type': 'application/json' })
+    res.end(out.body ?? '')
+  })
+  server.on('connection', (s) => {
+    sockets.add(s)
+    s.on('close', () => sockets.delete(s))
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const { port } = server.address()
+  return {
+    baseURL: `http://127.0.0.1:${port}/v1`,
+    requests,
+    close: () =>
+      new Promise((resolve) => {
+        for (const s of sockets) s.destroy()
+        server.close(resolve)
+      }),
+  }
+}
+
+const chatOk = (text) => ({ status: 200, body: JSON.stringify({ choices: [{ message: { content: text } }] }) })
+
+function bootHarness(config0 = {}) {
+  const toolDefs = new Map()
+  const registrations = new Map()
+  const handlers = new Map()
+  const resolvedSettings = Config({ ...config0 })
+  const attachments = {
+    saveImage: async (input) => ({
+      attachmentId: `mock-att-${Date.now()}-${Math.floor(Math.random() * 1e6)}`,
+      mediaType: input && input.mediaType ? input.mediaType : 'image/png',
+      bytes: input && input.data ? input.data.length : 0,
+      name: input && input.name ? input.name : undefined,
+    }),
+    readImage: async () => ({ data: PNG_BYTES, ref: { mediaType: 'image/png' } }),
+  }
+  const fsService = {
+    resolve: async (input) => input,
+    readBytes: async (target) => readFileSync(target),
+  }
+  const ctx = {
+    get(name) {
+      if (name === 'settings') return { get: () => undefined }
+      if (name === 'credentials') return { resolve: async () => ({ value: 'sk-test' }) }
+      if (name === 'attachments') return attachments
+      if (name === 'fs') return fsService
+      return undefined
+    },
+    logger: { warn() {}, info() {}, error() {} },
+    effect(fn) {
+      if (typeof fn === 'function') fn()
+      return () => {}
+    },
+    on(event, handler) {
+      handlers.set(event, handler)
+      return () => {}
+    },
+    inject(_deps, callback) {
+      const scope = {
+        get: () => resolvedSettings,
+        watch: () => () => {},
+      }
+      callback({ settings: { register: () => scope }, effect: () => () => {} })
+      return () => {}
+    },
+    tools: {
+      register(def) {
+        toolDefs.set(def.name, def)
+        return () => {}
+      },
+    },
+    llm: {
+      registerAdapter(providers, adapter) {
+        for (const provider of providers) {
+          registrations.set(provider, { adapter, retryPolicy: adapter.providerRetryPolicy ? adapter.providerRetryPolicy(provider) : undefined })
+        }
+        const handle = () => {}
+        handle.replace = () => {}
+        return handle
+      },
+      registration(provider) {
+        const hit = registrations.get(provider)
+        if (hit === undefined) throw new Error(`no adapter registered for provider "${provider}"`)
+        return hit
+      },
+      registerConfigurableProviders: () => ({ replace: () => {} }),
+      listProviders: () => [...registrations.keys()].map((id) => ({ id, name: id })),
+      listModels: async () => [],
+      resolveModelInfo: async () => ({ id: 'm', inputModalities: ['text', 'image'], image: true }),
+      async *stream(options) {
+        const registration = registrations.get(options && options.provider)
+        if (registration && registration.adapter && typeof registration.adapter.stream === 'function') {
+          yield* registration.adapter.stream(options)
+          return
+        }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      },
+    },
+  }
+  return { ctx, toolDefs, handlers }
+}
+
+test('explicit call cap: failed evidence does not consume it, successful evidence does', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'vr-depth-behavior-'))
+  const pngPath = path.join(dir, 'img.png')
+  writeFileSync(pngPath, PNG_BYTES)
+
+  const BOOTSTRAP_JSON = JSON.stringify({
+    visual_kind: 'mixed',
+    mixed_of: ['document', 'ui'],
+    overview: 'a mixed page',
+    content_kind: 'unknown',
+    regions: [],
+    visible_text: [],
+    entities: [],
+  })
+  const NO_EVIDENCE_JSON = JSON.stringify({
+    ok: false,
+    code: 'NO_USABLE_EVIDENCE',
+    retryable: false,
+    reason: 'simulated successful request with no usable visual evidence',
+  })
+  const server = await startFakeVisionServer(async (_req, _body, nth) =>
+    chatOk(nth === 1 ? BOOTSTRAP_JSON : NO_EVIDENCE_JSON),
+  )
+  try {
+    const config = {
+      structuredVisionBootstrap: true,
+      visionDepth: 'fast',
+      visionDepthMaxCalls: 1,
+      freeFallback: false,
+      localOllama: { enabled: true, baseURL: server.baseURL, model: 'm' },
+    }
+    const harness = bootHarness(config)
+    const hardenedCtx = installStructuredFlowHardening(harness.ctx, Config(config))
+    apply(hardenedCtx, Config(config))
+    hardenedCtx.tools.register({
+      name: 'vision_ground',
+      async execute() {
+        return JSON.stringify({ x1: 0, y1: 0, x2: 10, y2: 10, width: 100, height: 100 })
+      },
+    })
+
+    const session = { id: 'depth-behavior-session', header: { version: 4 }, events: [] }
+    const exec = { agent: { session } }
+    const imageMessages = [
+      { role: 'user', content: [{ type: 'image', attachment: { attachmentId: 'sha256:abc', mediaType: 'image/png' } }] },
+    ]
+    const imagePayload = { turn: 1, agent: { session }, messages: imageMessages }
+    const preStep = harness.handlers.get('agent/pre-step')
+    assert.ok(preStep)
+    const next = async () => ({ kind: 'ok', messages: imageMessages })
+    const hasCoreFollowup = (decision) =>
+      Array.isArray(decision && decision.messages) &&
+      decision.messages.some((m) =>
+        m && typeof m.id === 'string' && m.id.includes('vision-router-structured-followup-'),
+      )
+    const hasEvidenceGuard = (decision) =>
+      Array.isArray(decision && decision.messages) &&
+      decision.messages.some((m) =>
+        m && typeof m.id === 'string' && m.id.includes('vision-router-structured-evidence-guard-'),
+      )
+    const hasStopGuard = (decision) =>
+      Array.isArray(decision && decision.messages) &&
+      decision.messages.some((m) =>
+        m && typeof m.id === 'string' && m.id.includes('vision-router-structured-guard-stop-'),
+      )
+
+    const d1 = await preStep(imagePayload, next)
+    assert.equal(hasCoreFollowup(d1), false)
+    assert.equal(hasEvidenceGuard(d1), false)
+    assert.equal(hasStopGuard(d1), false)
+
+    const bootstrap = harness.toolDefs.get('vision_bootstrap')
+    assert.ok(bootstrap)
+    const bootRaw = await bootstrap.execute({ paths: [pngPath] }, exec)
+    const boot = JSON.parse(bootRaw)
+    assert.equal(boot.ok, true)
+    assert.equal(boot.phase, 'structured-bootstrap')
+
+    const d2 = await preStep(imagePayload, next)
+    assert.equal(hasCoreFollowup(d2), true)
+    assert.equal(hasEvidenceGuard(d2), false)
+    assert.equal(hasStopGuard(d2), false)
+
+    const describe = harness.toolDefs.get('vision_describe')
+    assert.ok(describe)
+    const r1 = await describe.execute({ paths: [pngPath], question: 'what is here?' }, exec)
+    const j1 = JSON.parse(r1)
+    assert.equal(j1.ok, false)
+    assert.equal(j1.code, 'NO_USABLE_EVIDENCE')
+
+    const d3 = await preStep(imagePayload, next)
+    assert.equal(hasCoreFollowup(d3), false)
+    assert.equal(hasEvidenceGuard(d3), true)
+    assert.equal(hasStopGuard(d3), false)
+    assert.deepEqual(
+      d3.messages.find((message) => message?.id?.includes('vision-router-structured-evidence-guard-'))?.source,
+      { kind: 'plugin:dsh-vision-router' },
+    )
+
+    const ground = harness.toolDefs.get('vision_ground')
+    assert.ok(ground)
+    const requestsBefore = server.requests.length
+    const r2 = await ground.execute({ question: 'locate the UI region' }, exec)
+    assert.deepEqual(JSON.parse(r2), { x1: 0, y1: 0, x2: 10, y2: 10, width: 100, height: 100 })
+    assert.equal(server.requests.length, requestsBefore)
+
+    const d4 = await preStep(imagePayload, next)
+    assert.equal(hasCoreFollowup(d4), false)
+    assert.equal(hasEvidenceGuard(d4), false)
+    assert.equal(hasStopGuard(d4), true)
+    assert.deepEqual(
+      d4.messages.find((message) => message?.id?.includes('vision-router-structured-guard-stop-'))?.source,
+      { kind: 'plugin:dsh-vision-router' },
+    )
+
+    const requestsBeforeBlock = server.requests.length
+    const r3 = await describe.execute({ paths: [pngPath], question: 'again' }, exec)
+    const j3 = JSON.parse(r3)
+    assert.equal(j3.ok, false)
+    assert.equal(j3.code, 'VISION_DEPTH_LIMIT')
+    assert.equal(server.requests.length, requestsBeforeBlock)
+  } finally {
+    await server.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

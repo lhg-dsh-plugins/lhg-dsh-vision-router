@@ -1,0 +1,47 @@
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
+
+test('core owns bootstrap presentation while hardening is the sole x>=1 evidence authority', async () => {
+  const core = await readFile(new URL('../index.js', import.meta.url), 'utf8')
+  const hardening = await readFile(new URL('../lib/structured-flow-hardening.js', import.meta.url), 'utf8')
+
+  // Core owns only the ordered bootstrap protocol and the model-visible
+  // transition into the task-directed 1+x phase. Its only follow-up latch is
+  // presentation state: whether that guidance was actually emitted.
+  assert.match(core, /STRUCTURED_BOOTSTRAP_REQUIRED/)
+  assert.match(core, /至少调用 1 个能新增或验证所需证据的视觉工具/)
+  assert.match(core, /normalizeStructuredBootstrapResult\(parsed, raw\)/)
+  assert.match(core, /该预识别只建立任务无关的视觉底图，不携带也不生成 goal/)
+  assert.match(core, /followupGuidanceEmitted: false/)
+  assert.match(core, /const appendStructuredReminder = \(baseMessages\) =>/)
+  assert.match(core, /bootstrapState\.followupGuidanceEmitted = true/)
+  assert.equal(core.match(/followupGuidanceEmitted = true/g)?.length ?? 0, 1)
+  assert.doesNotMatch(core, /followupCompleted/)
+  assert.doesNotMatch(core, /structuredFollowupEvidenceTools/)
+  assert.doesNotMatch(core, /evidenceFailure/)
+  assert.doesNotMatch(core, /并把真实任务写进 goal/)
+
+  // The outer structured-flow boundary is the sole hard completion authority.
+  // It asks only whether at least one usable task-directed evidence call landed;
+  // mixed classifications must not become branch quotas inferred from tool names.
+  assert.match(hardening, /successfulEvidenceCalls/)
+  assert.match(hardening, /postBootstrapEvidenceCalls/)
+  assert.match(hardening, /return state\.postBootstrapEvidenceCalls >= 1 \? 0 : 1/)
+  assert.match(hardening, /state\.successfulEvidenceCalls \+= 1/)
+  assert.match(hardening, /if \(state\.bootstrapDone\) state\.postBootstrapEvidenceCalls \+= 1/)
+  assert.doesNotMatch(hardening, /function inferBranchForTool/)
+  assert.doesNotMatch(hardening, /completedBranches/)
+  assert.doesNotMatch(hardening, /mixedAttemptSignatures/)
+
+  // OCR execution policy is tool-owned and model-visible: the generic deep-tool
+  // wrapper must not rewrite arguments, and structured mode must not silently
+  // change the configured OCR policy; explicit per-call engine still wins.
+  assert.match(core, /const engine = resolveVisionOcrEngine\(args\.engine, current\(\)\.ocrEngine\)/)
+  assert.match(core, /configured OCR engine policy applies/)
+  assert.match(core, /Structured 1\+x follow-up does not change the selected policy/)
+  assert.match(core, /explicit engine=tesseract or engine=vision always wins/)
+  assert.doesNotMatch(core, /resolveVisionOcrEngine\(args\.engine, structuredFollowup\)/)
+  assert.doesNotMatch(core, /effectiveArgs = \{ \.\.\.\(args \?\? \{\}\), engine: 'vision' \}/)
+  assert.doesNotMatch(core, /def\.name === 'vision_ocr' &&/)
+})

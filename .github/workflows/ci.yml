@@ -1,0 +1,170 @@
+name: CI
+
+on:
+  push:
+    branches: [main, 3.0, feat/auto-wrap-providers]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+  # Required test (22)/(24) checks must be emitted for every PR, including docs-only PRs.
+  # Keep push path filtering to avoid redundant post-merge builds.
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: ['22', '24']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Build canonical runtime artifacts
+        run: pnpm build
+      - name: Verify generated runtime artifacts
+        run: pnpm build:check
+      - name: Verify reproducible clean build
+        if: matrix.node == '22'
+        run: pnpm build:reproducible
+      - name: Typecheck Host and Client contracts
+        if: matrix.node == '22'
+        run: pnpm typecheck
+      - name: Lint canonical source ownership
+        if: matrix.node == '22'
+        run: pnpm lint
+      - name: Verify source-to-artifact evidence
+        if: matrix.node == '22'
+        run: pnpm source:artifact:check
+      - name: Verify generated browser source
+        if: matrix.node == '22'
+        run: pnpm client:check
+      - run: pnpm test
+
+  package-contract:
+    name: packed public API
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 11.20.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '22'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Build canonical package artifacts
+        run: pnpm build
+      - name: Pack one package candidate
+        run: |
+          mkdir -p tmp-pack
+          pnpm pack --pack-destination tmp-pack
+      - name: Verify packed runtime and declaration surface
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARBALL="$(find tmp-pack -maxdepth 1 -name 'dsh-vision-router-*.tgz' -print -quit)"
+          [ -n "$TARBALL" ]
+          node scripts/verify-packed-public-api.mjs "$TARBALL"
+
+  native-host-sharp:
+    name: host sharp / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 11.20.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '22'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Build canonical runtime artifacts
+        run: pnpm build
+      - name: Verify generated runtime artifacts
+        run: pnpm build:check
+      - name: Run cross-platform runtime and benchmark fixture regression tests
+        run: node --test tests/file-logger.test.js tests/logging-ui.test.js tests/runtime-boundary-fixes.test.js tests/qa-screenshot-runtime.test.js tests/vision-capability-benchmark.test.js
+      - name: Prepare pack directory
+        shell: node {0}
+        run: |
+          require('node:fs').mkdirSync('tmp-pack', { recursive: true })
+      - name: Pack plugin
+        run: pnpm pack --pack-destination tmp-pack
+      - name: Install into a DSH-like host and verify one shared sharp
+        shell: node {0}
+        run: |
+          const fs = require('node:fs')
+          const path = require('node:path')
+          const { spawnSync } = require('node:child_process')
+          const { createRequire } = require('node:module')
+          ;(async () => {
+            const tgz = fs.readdirSync('tmp-pack').find((name) => name.endsWith('.tgz'))
+            if (!tgz) throw new Error('packed plugin tarball not found')
+            const tarball = path.resolve('tmp-pack', tgz).replaceAll('\\', '/')
+            const hostDir = path.join(process.env.RUNNER_TEMP, 'dsh-vision-router-host')
+            fs.rmSync(hostDir, { recursive: true, force: true })
+            fs.mkdirSync(hostDir, { recursive: true })
+            fs.writeFileSync(path.join(hostDir, 'package.json'), JSON.stringify({
+              private: true,
+              packageManager: 'pnpm@11.20.0',
+              dependencies: {
+                sharp: '0.35.3',
+                'dsh-vision-router': `file:${tarball}`,
+              },
+            }, null, 2))
+            const cmd = process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm'
+            const installed = spawnSync(cmd, ['install'], {
+              cwd: hostDir,
+              stdio: 'inherit',
+              shell: process.platform === 'win32',
+            })
+            if (installed.status !== 0) process.exit(installed.status ?? 1)
+
+            const hostRequire = createRequire(path.join(hostDir, 'host-check.cjs'))
+            const pluginEntry = hostRequire.resolve('dsh-vision-router')
+            const pluginRequire = createRequire(pluginEntry)
+            const hostSharp = fs.realpathSync(hostRequire.resolve('sharp'))
+            const pluginSharp = fs.realpathSync(pluginRequire.resolve('sharp'))
+            console.log({ hostSharp, pluginSharp })
+            if (hostSharp !== pluginSharp) {
+              throw new Error('plugin installed/resolved a second sharp copy instead of using the host copy')
+            }
+            const sharp = hostRequire('sharp')
+            const out = await sharp({
+              create: {
+                width: 8,
+                height: 8,
+                channels: 4,
+                background: { r: 10, g: 20, b: 30, alpha: 1 },
+              },
+            }).resize(4, 4).png().toBuffer()
+            if (!Buffer.isBuffer(out) || out.length === 0) throw new Error('shared sharp pixel smoke test failed')
+            console.log(`shared sharp ${sharp.versions.sharp}; PNG bytes=${out.length}`)
+          })().catch((error) => {
+            console.error(error)
+            process.exit(1)
+          })

@@ -1,0 +1,198 @@
+// The drift canaries are the only gates that follow upstream without a pinned version,
+// so they must not pin anything about the Host they meet. `dsh-alpha-canary` once
+// inherited the `native-register` settings default — correct for the 0.1.5 train and
+// wrong for every 0.2.x Host — and reported "unsupported" for a release family DVR
+// supports, while `dsh-latest-canary` stayed green on the same version. These assertions
+// keep the repair in place: the floating gates derive the settings seam from the Host,
+// resolve their version from the registry, and report every contract they run.
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { readFile, readdir } from 'node:fs/promises'
+import path from 'node:path'
+
+const CANARIES = ['dsh-alpha-canary.yml', 'dsh-latest-canary.yml']
+
+async function readWorkflow(name) {
+  return readFile(new URL(`../.github/workflows/${name}`, import.meta.url), 'utf8')
+}
+
+test('floating canaries derive the settings seam instead of pinning one shape', async () => {
+  for (const name of CANARIES) {
+    const workflow = await readWorkflow(name)
+    // A canary may name the mode inline or hand a matrix value to the smoke; either way
+    // every effective mode must be `auto`, because the seam belongs to the Host.
+    const inline = [...workflow.matchAll(/EXPECT_SETTINGS_MODE:\s*(\S+)/g)]
+      .map((m) => m[1])
+      .filter((value) => !value.startsWith('${{'))
+    const matrixValues = [...workflow.matchAll(/settings_mode:\s*(\S+)/g)].map((m) => m[1])
+    const effective = [...new Set([...inline, ...matrixValues])]
+    assert.ok(effective.length > 0, `${name} must declare an effective settings mode`)
+    assert.deepEqual(effective, ['auto'], `${name} must let the Host decide the settings seam`)
+    if (/EXPECT_SETTINGS_MODE: \$\{\{ matrix\.settings_mode \}\}/.test(workflow)) {
+      assert.ok(matrixValues.length > 0, `${name} must define matrix.settings_mode`)
+    }
+    // A seam pinned here goes stale on the next upstream settings change: that is how
+    // the alpha canary reported a supported Host as unsupported.
+    assert.doesNotMatch(workflow, /EXPECT_SETTINGS_MODE: (native-register|config-editor)/)
+  }
+})
+
+test('floating canaries resolve the release from the registry, not from a pinned version', async () => {
+  for (const name of CANARIES) {
+    const workflow = await readWorkflow(name)
+    assert.match(workflow, /dist-tags\./, `${name} must follow the published dist-tags`)
+  }
+})
+
+test('the alpha canary reports every contract instead of stopping at the first failure', async () => {
+  const workflow = await readWorkflow('dsh-alpha-canary.yml')
+  for (const id of ['alpha-host-capability', 'alpha-pi-ai-wire', 'alpha-native-lifecycle']) {
+    assert.match(workflow, new RegExp(`id: ${id}\\n\\s+continue-on-error: true`), `${id} must not mask later contracts`)
+  }
+  assert.match(workflow, /name: Require every alpha contract\n\s+if: always\(\)/)
+  assert.match(workflow, /alpha contracts failed/)
+})
+
+// The channel canary decides from `pull_request.paths` whether to run at all. Its smoke
+// script grew a local module in the settings-seam repair, and a path list that names only
+// the smoke silently skips the one gate that meets real floating Hosts. Derive the smoke's
+// relative module imports so a future extraction cannot fall out of the trigger again.
+test('the channel canary PR trigger covers its smoke script and every local module it imports', async () => {
+  const workflow = await readWorkflow('dsh-latest-canary.yml')
+  const pathsBlock = workflow.match(/\n {4}paths:\n((?: {6}- '[^']+'\n)+)/)?.[1] ?? ''
+  const triggeredPaths = [...pathsBlock.matchAll(/- '([^']+)'/g)].map((m) => m[1])
+  assert.ok(triggeredPaths.length > 0, 'dsh-latest-canary.yml must keep a pull_request paths list')
+
+  const smoke = await readFile(new URL('../scripts/dsh-host-contract-smoke.mjs', import.meta.url), 'utf8')
+  const localModules = [...new Set([...smoke.matchAll(/from '(\.\.?\/[^']+\.mjs)'/g)].map((m) => m[1]))]
+  const requiredPaths = [
+    'scripts/dsh-host-contract-smoke.mjs',
+    ...localModules.map((specifier) => path.posix.normalize(path.posix.join('scripts', specifier))),
+  ]
+
+  for (const requiredPath of requiredPaths) {
+    assert.ok(
+      triggeredPaths.includes(requiredPath),
+      `dsh-latest-canary.yml must also run when ${requiredPath} changes`,
+    )
+  }
+})
+
+// Workflow path filters decide whether a gate runs at all. Derive both sides mechanically:
+// every repo file a workflow executes — files named in its `run:` blocks and files behind the
+// `pnpm <script>` commands it invokes — must be covered by that workflow's pull_request.paths,
+// and the end-to-end gates that build or drive the product must trigger on the whole source
+// tree. Implicit install lifecycle scripts are out of scope here: `ci.yml` runs `pnpm install`
+// and the full suite on every pull request, so build tooling is exercised even when a filtered
+// gate stays idle.
+function globToRegExp(pattern) {
+  let source = ''
+  for (let i = 0; i < pattern.length; i += 1) {
+    const char = pattern[i]
+    if (char === '*') {
+      if (pattern[i + 1] === '*') { source += '.*'; i += 1 } else { source += '[^/]*' }
+    } else if ('\\^$.|?+()[]{}'.includes(char)) {
+      source += `\\${char}`
+    } else {
+      source += char
+    }
+  }
+  return new RegExp(`^${source}$`)
+}
+
+function isCoveredBy(target, patterns) {
+  return patterns.some((pattern) => (
+    pattern.includes('*') ? globToRegExp(pattern).test(target) : pattern === target
+  ))
+}
+
+function pullRequestPatterns(workflow) {
+  const lines = workflow.split('\n')
+  const start = lines.findIndex((line) => line === '  pull_request:')
+  if (start === -1) return []
+  let end = lines.length
+  for (let i = start + 1; i < lines.length; i += 1) {
+    if (/^ {2}\S/.test(lines[i])) { end = i; break }
+  }
+  const patterns = []
+  let inPaths = false
+  for (const line of lines.slice(start + 1, end)) {
+    const key = line.match(/^ {4}(paths|paths-ignore):\s*$/)
+    if (key) { inPaths = key[1] === 'paths'; continue }
+    const item = line.match(/^ {6}- '([^']+)'\s*$/)
+    if (item && inPaths) patterns.push(item[1])
+  }
+  return patterns
+}
+
+let packageScriptsPromise = null
+
+async function packageScripts() {
+  packageScriptsPromise ??= readFile(new URL('../package.json', import.meta.url), 'utf8')
+    .then((text) => JSON.parse(text).scripts ?? {})
+  return packageScriptsPromise
+}
+
+function collectRepoFiles(text, scripts, seen, files) {
+  for (const match of text.matchAll(/(?<![\w/])(?:\.\.\/dvr\/)?((?:scripts|tests)\/[\w./-]+\.(?:mjs|js))/g)) {
+    files.add(match[1])
+  }
+  for (const match of text.matchAll(/\bpnpm(?:\s+run)?\s+([\w:-]+)/g)) {
+    const name = match[1]
+    if (seen.has(name)) continue
+    seen.add(name)
+    if (scripts[name]) collectRepoFiles(scripts[name], scripts, seen, files)
+  }
+  return files
+}
+
+async function executedRepoFiles(workflow) {
+  const lines = workflow.split('\n')
+  const blocks = []
+  let current = null
+  for (const line of lines) {
+    const run = line.match(/^(\s*)run:\s*(.*)$/)
+    if (run) {
+      current = { indent: run[1].length, text: run[2] }
+      blocks.push(current)
+      continue
+    }
+    if (!current) continue
+    if (line.trim() === '') { current.text += '\n'; continue }
+    if (line.match(/^\s*/)[0].length > current.indent) current.text += `\n${line}`
+    else current = null
+  }
+  const scripts = await packageScripts()
+  const files = new Set()
+  for (const block of blocks) collectRepoFiles(block.text, scripts, new Set(), files)
+  return [...files].sort()
+}
+
+test('every PR-triggered workflow triggers on the repo files it executes', async () => {
+  const workflowsDir = new URL('../.github/workflows/', import.meta.url)
+  const names = (await readdir(workflowsDir)).filter((name) => name.endsWith('.yml')).sort()
+  const violations = []
+  for (const name of names) {
+    const workflow = await readWorkflow(name)
+    const patterns = pullRequestPatterns(workflow)
+    if (patterns.length === 0) continue
+    for (const executed of await executedRepoFiles(workflow)) {
+      if (!isCoveredBy(executed, patterns)) violations.push(`${name}: ${executed}`)
+    }
+  }
+  assert.deepEqual(violations, [], 'PR triggers must cover the repo files each workflow executes')
+})
+
+const PRODUCT_GATES = [
+  'alpha-browser-cold-toggle-smoke.yml',
+  'browser-p1-acceptance.yml',
+  'dsh-alpha-source-contract.yml',
+]
+
+test('end-to-end gates trigger on the whole product source tree', async () => {
+  for (const name of PRODUCT_GATES) {
+    const patterns = pullRequestPatterns(await readWorkflow(name))
+    assert.ok(patterns.length > 0, `${name} must keep a pull_request paths list`)
+    assert.ok(patterns.includes('src/**'), `${name} must trigger on src/**`)
+  }
+})

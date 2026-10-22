@@ -1,0 +1,670 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (for example v2.0.0)
+        required: true
+        type: string
+      target_sha:
+        description: Exact current main commit SHA to release
+        required: true
+        type: string
+
+# Deny the implicit GITHUB_TOKEN by default. Each release phase opts into only
+# the capability it needs.
+permissions: {}
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify release source
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      package_tarball: ${{ steps.prepack.outputs.tarball }}
+      package_file_count: ${{ steps.prepack.outputs.file_count }}
+      package_sha1: ${{ steps.prepack.outputs.sha1 }}
+      package_sha256: ${{ steps.prepack.outputs.sha256 }}
+    permissions:
+      contents: read
+      artifact-metadata: write
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      RELEASE_SHA: ${{ inputs.target_sha }}
+    steps:
+      - name: Checkout exact release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.RELEASE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org/'
+          cache: pnpm
+
+      - name: Verify requested release identity and package metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./package.json').version")"
+          EXPECTED_TAG="v$VERSION"
+
+          [ "$RELEASE_TAG" = "$EXPECTED_TAG" ] || {
+            echo "::error::requested tag $RELEASE_TAG does not match package.json version $VERSION"
+            exit 1
+          }
+          [ "$(git rev-parse HEAD)" = "$RELEASE_SHA" ] || {
+            echo "::error::checkout HEAD does not match requested release SHA"
+            exit 1
+          }
+
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          CURRENT_MAIN_SHA="$(git rev-parse origin/main)"
+          REMOTE_TAG_SHA="$(git ls-remote origin "refs/tags/$RELEASE_TAG" | awk 'NR==1 {print $1}')"
+          [ -z "$REMOTE_TAG_SHA" ] || {
+            echo "::error::$RELEASE_TAG already exists at $REMOTE_TAG_SHA. A released version is immutable; pick the next version instead of re-releasing $RELEASE_TAG."
+            exit 1
+          }
+          # The dispatch ref decides the OIDC SourceRepositoryDigest that
+          # actions/attest records and that `gh attestation verify
+          # --source-digest` enforces. Dispatching from a branch that is not the
+          # release commit therefore mints provenance for the wrong commit, so
+          # the only safe release target is the exact current origin/main HEAD.
+          [ "$CURRENT_MAIN_SHA" = "$RELEASE_SHA" ] || {
+            echo "::error::manual release target must be the exact current origin/main HEAD ($CURRENT_MAIN_SHA)"
+            exit 1
+          }
+
+          # Release identity and artifact verification are hard gates, and the
+          # release-documentation contract is part of the release: both README
+          # announcement bars must carry the version being released, and either
+          # a curated docs/releases/<tag>.md file or a matching CHANGELOG.md
+          # section must exist. AGENTS.md rule 9 owns this contract.
+          for f in README.md README.zh.md; do
+            BAR="$(awk '
+              /^>[[:space:]]*\[!WARNING\]/ { inbar = 1; next }
+              inbar && /^>/ { print; next }
+              inbar { exit }
+            ' "$f")"
+            if ! printf '%s\n' "$BAR" | grep -Eq "(${EXPECTED_TAG}|${VERSION})"; then
+              echo "::error::$f is missing a top [!WARNING] announcement bar mentioning ${EXPECTED_TAG}; update the bar before releasing"
+              exit 1
+            fi
+          done
+          CURATED_NOTES="docs/releases/$EXPECTED_TAG.md"
+          if [ ! -s "$CURATED_NOTES" ] && ! awk -v v="$EXPECTED_TAG" '$0 == "## " v { found=1 } END { exit found ? 0 : 1 }' CHANGELOG.md; then
+            echo "::error::no curated release notes ($CURATED_NOTES) and no CHANGELOG.md section for $EXPECTED_TAG"
+            exit 1
+          fi
+
+          node <<'NODE'
+          const pkg = require('./package.json')
+          const scripts = pkg.scripts || {}
+          const requiredBuildLifecycle = {
+            prepare: 'pnpm build',
+            prepack: 'pnpm build',
+          }
+          for (const [name, expected] of Object.entries(requiredBuildLifecycle)) {
+            if (scripts[name] !== expected) {
+              console.error(`${name} must remain exactly ${JSON.stringify(expected)} for canonical source builds`)
+              process.exit(1)
+            }
+          }
+          const forbidden = [
+            'preinstall', 'install', 'postinstall', 'postpack',
+            'prepublish', 'prepublishOnly', 'publish', 'postpublish',
+          ]
+          const found = forbidden.filter(name => Object.prototype.hasOwnProperty.call(scripts, name))
+          if (found.length) {
+            console.error(`Forbidden release/install lifecycle scripts present: ${found.join(', ')}`)
+            process.exit(1)
+          }
+          NODE
+
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build canonical package artifacts
+        run: pnpm build
+
+      - name: Verify generated package artifacts
+        run: pnpm build:check
+
+      - name: Lint canonical source ownership
+        run: pnpm lint
+
+      - name: Verify source-to-artifact evidence
+        run: pnpm source:artifact:check
+
+      - name: Verify reproducible clean build
+        run: pnpm build:reproducible
+
+      - name: Typecheck Host and Client contracts
+        run: pnpm typecheck
+
+      - name: Run tests
+        run: pnpm test
+
+      - name: Verify generated browser source
+        run: pnpm client:check
+
+      - name: Verify release Host support policy
+        run: node --test tests/dsh-support-window.test.js
+
+      - name: Pin npm pack client by verified tarball
+        shell: bash
+        env:
+          NPM_CLI_VERSION: '11.18.0'
+          NPM_CLI_SHA256: '73f6155215ebabf4ed96dca1f567c2372cc713c33af2e5b9b62fde4e92373e2e'
+        run: |
+          set -euo pipefail
+          NPM_ROOT="$RUNNER_TEMP/npm-cli-$NPM_CLI_VERSION"
+          NPM_TARBALL="$RUNNER_TEMP/npm-$NPM_CLI_VERSION.tgz"
+          curl --fail --silent --show-error --location \
+            "https://registry.npmjs.org/npm/-/npm-$NPM_CLI_VERSION.tgz" \
+            --output "$NPM_TARBALL"
+          printf '%s  %s\n' "$NPM_CLI_SHA256" "$NPM_TARBALL" | sha256sum --check --strict
+          rm -rf "$NPM_ROOT"
+          mkdir -p "$NPM_ROOT" "$RUNNER_TEMP/npm-cli-bin"
+          tar -xzf "$NPM_TARBALL" -C "$NPM_ROOT" --strip-components=1
+          ln -sfn "$NPM_ROOT/bin/npm-cli.js" "$RUNNER_TEMP/npm-cli-bin/npm"
+          echo "$RUNNER_TEMP/npm-cli-bin" >> "$GITHUB_PATH"
+
+      - name: Preflight exact packed contract before irreversible tag
+        id: prepack
+        shell: bash
+        env:
+          NPM_CONFIG_IGNORE_SCRIPTS: 'true'
+          RELEASE_REGISTRY_PROBE_ATTEMPTS: '3'
+          RELEASE_REGISTRY_DELAY_MS: '2000'
+        run: |
+          set -euo pipefail
+          rm -f pretag-pack.json
+          npm pack --json > pretag-pack.json
+          TARBALL="$(node -e "const p=require('./pretag-pack.json'); if(!Array.isArray(p)||p.length!==1||!p[0].filename) process.exit(1); process.stdout.write(p[0].filename)")"
+          FILE_COUNT="$(node -e "const p=require('./pretag-pack.json'); process.stdout.write(String(p[0].files?.length ?? ''))")"
+          VERSION="$(node -p "require('./package.json').version")"
+          node scripts/verify-packed-public-api.mjs "$TARBALL"
+
+          # A version on npm without this exact SHA-1 means someone published
+          # outside this workflow, or a previous release of the same version
+          # already happened. Both are unrecoverable here: the immutable tag and
+          # npm version are single-use, so refuse before creating anything.
+          INSPECT_OUTPUT="$RUNNER_TEMP/release-registry-inspect.out"
+          : > "$INSPECT_OUTPUT"
+          GITHUB_OUTPUT="$INSPECT_OUTPUT" node scripts/release-registry-identity.mjs inspect "$VERSION"
+          ALREADY_PUBLISHED="$(awk -F= '$1=="already_published" {print $2}' "$INSPECT_OUTPUT" | tail -n1)"
+          [ "$ALREADY_PUBLISHED" != "true" ] || {
+            echo "::error::npm already exposes dsh-vision-router@$VERSION; refusing to adopt or republish a pre-existing registry version"
+            exit 1
+          }
+
+          LOCAL_SHA1="$(sha1sum "$TARBALL" | awk '{print $1}')"
+          LOCAL_SHA256="$(sha256sum "$TARBALL" | awk '{print $1}')"
+          echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
+          echo "file_count=$FILE_COUNT" >> "$GITHUB_OUTPUT"
+          echo "sha1=$LOCAL_SHA1" >> "$GITHUB_OUTPUT"
+          echo "sha256=$LOCAL_SHA256" >> "$GITHUB_OUTPUT"
+
+      - name: Persist exact pre-tag package candidate
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-package-candidate
+          path: ${{ steps.prepack.outputs.tarball }}
+          if-no-files-found: error
+          retention-days: 1
+
+
+  tag:
+    name: Materialize verified release tag
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      RELEASE_SHA: ${{ inputs.target_sha }}
+    steps:
+      - name: Ensure immutable release tag exists at verified SHA
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if REMOTE_TAG_SHA="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha' 2>/dev/null)"; then
+            [ "$REMOTE_TAG_SHA" = "$RELEASE_SHA" ] || {
+              echo "::error::$RELEASE_TAG already exists at $REMOTE_TAG_SHA, expected $RELEASE_SHA"
+              exit 1
+            }
+            echo "$RELEASE_TAG already exists at the verified release SHA"
+            exit 0
+          fi
+
+          [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] || {
+            echo "::error::tag event did not resolve to an existing remote tag"
+            exit 1
+          }
+
+          CURRENT_MAIN_SHA="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          [ "$CURRENT_MAIN_SHA" = "$RELEASE_SHA" ] || {
+            echo "::error::current main moved to $CURRENT_MAIN_SHA after verification; refusing to tag $RELEASE_SHA"
+            exit 1
+          }
+
+          gh api \
+            --method POST \
+            "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f ref="refs/tags/$RELEASE_TAG" \
+            -f sha="$RELEASE_SHA"
+
+          CREATED_SHA="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          [ "$CREATED_SHA" = "$RELEASE_SHA" ] || {
+            echo "::error::created tag does not resolve to verified release SHA"
+            exit 1
+          }
+
+  publish:
+    name: Publish verified package
+    needs: [verify, tag]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    outputs:
+      release_version: ${{ steps.identity.outputs.version }}
+      package_tarball: ${{ steps.package.outputs.tarball }}
+      package_file_count: ${{ steps.package.outputs.file_count }}
+      package_sha1: ${{ steps.package.outputs.sha1 }}
+      package_sha256: ${{ steps.package.outputs.sha256 }}
+      provenance_name: ${{ steps.provenance.outputs.name }}
+      provenance_sha256: ${{ steps.provenance.outputs.sha256 }}
+      attestation_url: ${{ steps.attest.outputs.attestation-url }}
+    env:
+      NPM_CONFIG_IGNORE_SCRIPTS: 'true'
+      RELEASE_TAG: ${{ inputs.tag }}
+      RELEASE_SHA: ${{ inputs.target_sha }}
+      PRETAG_TARBALL: ${{ needs.verify.outputs.package_tarball }}
+      PRETAG_FILE_COUNT: ${{ needs.verify.outputs.package_file_count }}
+      PRETAG_SHA1: ${{ needs.verify.outputs.package_sha1 }}
+      PRETAG_SHA256: ${{ needs.verify.outputs.package_sha256 }}
+    steps:
+      - name: Checkout exact release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.RELEASE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js for npm trusted publishing
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org/'
+          package-manager-cache: false
+
+      - name: Pin npm trusted-publishing client by verified tarball
+        shell: bash
+        env:
+          NPM_CLI_VERSION: '11.18.0'
+          NPM_CLI_SHA256: '73f6155215ebabf4ed96dca1f567c2372cc713c33af2e5b9b62fde4e92373e2e'
+        run: |
+          set -euo pipefail
+          NPM_ROOT="$RUNNER_TEMP/npm-cli-$NPM_CLI_VERSION"
+          NPM_TARBALL="$RUNNER_TEMP/npm-$NPM_CLI_VERSION.tgz"
+          curl --fail --silent --show-error --location \
+            "https://registry.npmjs.org/npm/-/npm-$NPM_CLI_VERSION.tgz" \
+            --output "$NPM_TARBALL"
+          printf '%s  %s\n' "$NPM_CLI_SHA256" "$NPM_TARBALL" | sha256sum --check --strict
+          rm -rf "$NPM_ROOT"
+          mkdir -p "$NPM_ROOT" "$RUNNER_TEMP/npm-cli-bin"
+          tar -xzf "$NPM_TARBALL" -C "$NPM_ROOT" --strip-components=1
+          ln -sfn "$NPM_ROOT/bin/npm-cli.js" "$RUNNER_TEMP/npm-cli-bin/npm"
+          echo "$RUNNER_TEMP/npm-cli-bin" >> "$GITHUB_PATH"
+          export PATH="$RUNNER_TEMP/npm-cli-bin:$PATH"
+          echo "node=$(node --version)"
+          echo "npm=$(npm --version)"
+          node <<'NODE'
+          const node = process.versions.node.split('.').map(Number)
+          if (node[0] < 22 || (node[0] === 22 && node[1] < 14)) {
+            throw new Error(`Node ${process.versions.node} is below the npm trusted-publishing minimum 22.14.0`)
+          }
+          NODE
+          NPM_VERSION="$(npm --version)"
+          node - "$NPM_VERSION" <<'NODE'
+          const version = process.argv[2].split('.').map(Number)
+          const min = [11, 5, 1]
+          const ok = version.some((part, i) => part > min[i] && version.slice(0, i).every((v, j) => v === min[j])) || version.every((v, i) => v === min[i])
+          if (!ok) throw new Error(`npm ${process.argv[2]} is below the trusted-publishing minimum 11.5.1`)
+          NODE
+
+      - name: Re-verify immutable release identity
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./package.json').version")"
+          EXPECTED_TAG="v$VERSION"
+          [ "$RELEASE_TAG" = "$EXPECTED_TAG" ]
+          [ "$(git rev-parse HEAD)" = "$RELEASE_SHA" ]
+
+          REMOTE_TAG_SHA="$(git ls-remote origin "refs/tags/$RELEASE_TAG" | awk 'NR==1 {print $1}')"
+          [ "$REMOTE_TAG_SHA" = "$RELEASE_SHA" ] || {
+            echo "::error::$RELEASE_TAG no longer resolves to verified release SHA"
+            exit 1
+          }
+
+          echo "RELEASE_VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Rehydrate exact pre-tag package candidate
+        id: package
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          HANDOFF_DIR="$RUNNER_TEMP/release-package-candidate"
+          rm -rf "$HANDOFF_DIR"
+          mkdir -p "$HANDOFF_DIR"
+          gh run download "$GITHUB_RUN_ID" \
+            --name release-package-candidate \
+            --dir "$HANDOFF_DIR"
+          [ -f "$HANDOFF_DIR/$PRETAG_TARBALL" ] || {
+            echo "::error::pre-tag package handoff is missing $PRETAG_TARBALL"
+            exit 1
+          }
+          mv "$HANDOFF_DIR/$PRETAG_TARBALL" "$PRETAG_TARBALL"
+          LOCAL_SHA1="$(sha1sum "$PRETAG_TARBALL" | awk '{print $1}')"
+          LOCAL_SHA256="$(sha256sum "$PRETAG_TARBALL" | awk '{print $1}')"
+          [ "$LOCAL_SHA1" = "$PRETAG_SHA1" ] || {
+            echo "::error::pre-tag package handoff failed SHA-1 verification"
+            exit 1
+          }
+          [ "$LOCAL_SHA256" = "$PRETAG_SHA256" ] || {
+            echo "::error::pre-tag package handoff failed SHA-256 verification"
+            exit 1
+          }
+
+          echo "PACKAGE_TARBALL=$PRETAG_TARBALL" >> "$GITHUB_ENV"
+          echo "PACKAGE_FILE_COUNT=$PRETAG_FILE_COUNT" >> "$GITHUB_ENV"
+          echo "PACKAGE_SHA1=$LOCAL_SHA1" >> "$GITHUB_ENV"
+          echo "PACKAGE_SHA256=$LOCAL_SHA256" >> "$GITHUB_ENV"
+          echo "tarball=$PRETAG_TARBALL" >> "$GITHUB_OUTPUT"
+          echo "file_count=$PRETAG_FILE_COUNT" >> "$GITHUB_OUTPUT"
+          echo "sha1=$LOCAL_SHA1" >> "$GITHUB_OUTPUT"
+          echo "sha256=$LOCAL_SHA256" >> "$GITHUB_OUTPUT"
+          printf '%s  %s\n' "$LOCAL_SHA256" "$PRETAG_TARBALL" > SHA256SUMS.txt
+
+      - name: Check existing npm version
+        id: registry
+        env:
+          RELEASE_REGISTRY_PROBE_ATTEMPTS: '3'
+          RELEASE_REGISTRY_DELAY_MS: '2000'
+        run: node scripts/release-registry-identity.mjs probe "$RELEASE_VERSION" "$PACKAGE_SHA1"
+
+      - name: Publish exact tarball to npm with trusted OIDC
+        if: steps.registry.outputs.already_published == 'false'
+        shell: bash
+        run: npm publish "$PACKAGE_TARBALL" --provenance --access public
+
+      - name: Verify npm registry tarball identity
+        env:
+          # npm trusted publishing can return success before the public registry
+          # exposes the immutable version. Treat that as eventual consistency,
+          # not as a failed publish, while preserving fail-closed SHA identity.
+          RELEASE_REGISTRY_WAIT_ATTEMPTS: '120'
+          RELEASE_REGISTRY_DELAY_MS: '5000'
+        run: node scripts/release-registry-identity.mjs wait "$RELEASE_VERSION" "$PACKAGE_SHA1"
+
+      - name: Generate signed SLSA provenance for the exact tarball
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ steps.package.outputs.tarball }}
+
+      - name: Verify and export the release provenance bundle
+        id: provenance
+        shell: bash
+        env:
+          ATTEST_BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+          ATTESTATION_URL: ${{ steps.attest.outputs.attestation-url }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PROVENANCE_NAME="${PACKAGE_TARBALL}.intoto.jsonl"
+          [ -s "$ATTEST_BUNDLE_PATH" ] || {
+            echo "::error::attestation action did not produce a provenance bundle"
+            exit 1
+          }
+          [ -n "$ATTESTATION_URL" ] || {
+            echo "::error::attestation action did not publish a provenance record"
+            exit 1
+          }
+          cp "$ATTEST_BUNDLE_PATH" "$PROVENANCE_NAME"
+
+          gh attestation verify "$PACKAGE_TARBALL" \
+            --repo "$GITHUB_REPOSITORY" \
+            --bundle "$PROVENANCE_NAME" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+            --source-digest "$RELEASE_SHA" \
+            --deny-self-hosted-runners >/dev/null
+
+          PROVENANCE_BYTES="$(wc -c < "$PROVENANCE_NAME" | tr -d '[:space:]')"
+          [ "$PROVENANCE_BYTES" -gt 0 ] && [ "$PROVENANCE_BYTES" -le 131072 ] || {
+            echo "::error::provenance bundle size is outside the release handoff budget"
+            exit 1
+          }
+          PROVENANCE_SHA256="$(sha256sum "$PROVENANCE_NAME" | awk '{print $1}')"
+          echo "name=$PROVENANCE_NAME" >> "$GITHUB_OUTPUT"
+          echo "sha256=$PROVENANCE_SHA256" >> "$GITHUB_OUTPUT"
+
+      - name: Persist verified provenance for the release phase
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-provenance
+          path: ${{ steps.provenance.outputs.name }}
+          if-no-files-found: error
+          retention-days: 1
+
+
+  github-release:
+    name: Publish immutable GitHub Release
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      RELEASE_SHA: ${{ inputs.target_sha }}
+      RELEASE_VERSION: ${{ needs.publish.outputs.release_version }}
+      PACKAGE_TARBALL: ${{ needs.publish.outputs.package_tarball }}
+      PACKAGE_FILE_COUNT: ${{ needs.publish.outputs.package_file_count }}
+      PACKAGE_SHA1: ${{ needs.publish.outputs.package_sha1 }}
+      PACKAGE_SHA256: ${{ needs.publish.outputs.package_sha256 }}
+      PROVENANCE_NAME: ${{ needs.publish.outputs.provenance_name }}
+      PROVENANCE_SHA256: ${{ needs.publish.outputs.provenance_sha256 }}
+      ATTESTATION_URL: ${{ needs.publish.outputs.attestation_url }}
+    steps:
+      - name: Checkout exact release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.RELEASE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Rehydrate exact npm release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location \
+            "https://registry.npmjs.org/dsh-vision-router/-/dsh-vision-router-$RELEASE_VERSION.tgz" \
+            --output "$PACKAGE_TARBALL"
+          [ "$(sha1sum "$PACKAGE_TARBALL" | awk '{print $1}')" = "$PACKAGE_SHA1" ] || {
+            echo "::error::downloaded npm release asset SHA-1 differs from verified publish output"
+            exit 1
+          }
+          [ "$(sha256sum "$PACKAGE_TARBALL" | awk '{print $1}')" = "$PACKAGE_SHA256" ] || {
+            echo "::error::downloaded npm release asset SHA-256 differs from verified publish output"
+            exit 1
+          }
+          printf '%s  %s\n' "$PACKAGE_SHA256" "$PACKAGE_TARBALL" > SHA256SUMS.txt
+
+      - name: Rehydrate verified provenance from this workflow run
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [ "$PROVENANCE_NAME" = "${PACKAGE_TARBALL}.intoto.jsonl" ] || {
+            echo "::error::unexpected provenance asset name"
+            exit 1
+          }
+          HANDOFF_DIR="$RUNNER_TEMP/release-provenance-handoff"
+          rm -rf "$HANDOFF_DIR"
+          mkdir -p "$HANDOFF_DIR"
+          gh run download "$GITHUB_RUN_ID" \
+            --name release-provenance \
+            --dir "$HANDOFF_DIR"
+          [ -f "$HANDOFF_DIR/$PROVENANCE_NAME" ] || {
+            echo "::error::release provenance artifact is missing the expected bundle"
+            exit 1
+          }
+          mv "$HANDOFF_DIR/$PROVENANCE_NAME" "$PROVENANCE_NAME"
+          [ -s "$PROVENANCE_NAME" ] || {
+            echo "::error::release provenance bundle is empty"
+            exit 1
+          }
+          [ "$(sha256sum "$PROVENANCE_NAME" | awk '{print $1}')" = "$PROVENANCE_SHA256" ] || {
+            echo "::error::release provenance handoff failed SHA-256 verification"
+            exit 1
+          }
+          printf '%s  %s\n' "$PROVENANCE_SHA256" "$PROVENANCE_NAME" >> SHA256SUMS.txt
+
+      - name: Compose immutable release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          CURATED_NOTES="docs/releases/$RELEASE_TAG.md"
+          if [ -s "$CURATED_NOTES" ]; then
+            cat "$CURATED_NOTES" > release-notes.md
+          else
+            {
+              echo "# $RELEASE_TAG"
+              echo
+            } > release-notes.md
+            CHANGELOG_SECTION="$(mktemp)"
+            awk -v v="$RELEASE_TAG" '$0 == "## " v { flag=1; next } /^## / && flag { exit } flag' CHANGELOG.md > "$CHANGELOG_SECTION"
+            if [ -s "$CHANGELOG_SECTION" ]; then
+              cat "$CHANGELOG_SECTION" >> release-notes.md
+            else
+              echo "> Release notes were not curated for this tag; see the immutable commit list below for the exact changes." >> release-notes.md
+            fi
+            rm -f "$CHANGELOG_SECTION"
+          fi
+          {
+            echo
+            echo "## Commits"
+            echo
+          } >> release-notes.md
+          PREV_TAG="$(git describe --tags --abbrev=0 "$RELEASE_SHA^" 2>/dev/null || true)"
+          if [ -n "$PREV_TAG" ]; then
+            git log --pretty=format:'- %s' "$PREV_TAG..$RELEASE_SHA" >> release-notes.md
+          else
+            git log --pretty=format:'- %s' "$RELEASE_SHA" >> release-notes.md
+          fi
+          {
+            echo
+            echo
+            echo "## Supply-chain verification"
+            echo
+            echo "- Git commit: \`$RELEASE_SHA\`"
+            echo "- npm tarball SHA-1: \`$PACKAGE_SHA1\`"
+            echo "- tarball SHA-256: \`$PACKAGE_SHA256\`"
+            echo "- packed files: \`$PACKAGE_FILE_COUNT\`"
+            echo "- npm provenance: enabled via trusted publishing (OIDC)"
+            echo "- GitHub SLSA provenance: $ATTESTATION_URL"
+            echo "- offline provenance bundle: \`$PROVENANCE_NAME\`"
+            echo "- verify: \`gh attestation verify $PACKAGE_TARBALL -R $GITHUB_REPOSITORY --bundle $PROVENANCE_NAME --signer-workflow $GITHUB_REPOSITORY/.github/workflows/release.yml\`"
+          } >> release-notes.md
+
+      - name: Create immutable GitHub Release (draft, attach, publish)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Immutability applies the moment a release is published, so the
+          # release is created as a draft, every immutable asset is attached and
+          # verified, and only then is it published. A failure before the final
+          # publish leaves a draft that can be deleted and retried, never a
+          # published release that is missing or mismatching assets.
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
+              --verify-tag \
+              --draft \
+              --title "$RELEASE_TAG" \
+              --notes-file release-notes.md
+          fi
+
+          for asset in "$PACKAGE_TARBALL" "$PROVENANCE_NAME" "SHA256SUMS.txt"; do
+            [ -s "$asset" ] || {
+              echo "::error::release asset $asset is missing locally"
+              exit 1
+            }
+          done
+
+          gh release upload "$RELEASE_TAG" \
+            "$PACKAGE_TARBALL" \
+            "$PROVENANCE_NAME" \
+            "SHA256SUMS.txt" \
+            --clobber
+
+          ASSETS="$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')"
+          for asset in "$PACKAGE_TARBALL" "$PROVENANCE_NAME" "SHA256SUMS.txt"; do
+            printf '%s\n' "$ASSETS" | grep -Fqx -- "$asset" || {
+              echo "::error::GitHub Release draft is missing required asset $asset"
+              exit 1
+            }
+          done
+
+          # Verify the attached tarball against the verified pre-tag candidate
+          # rather than trusting the upload.
+          VERIFY_DIR="$RUNNER_TEMP/release-asset-verify"
+          rm -rf "$VERIFY_DIR"
+          mkdir -p "$VERIFY_DIR"
+          gh release download "$RELEASE_TAG" --pattern "$PACKAGE_TARBALL" --dir "$VERIFY_DIR"
+          [ "$(sha256sum "$VERIFY_DIR/$PACKAGE_TARBALL" | awk '{print $1}')" = "$PACKAGE_SHA256" ] || {
+            echo "::error::attached release tarball does not match the verified package SHA-256"
+            exit 1
+          }
+
+          # Publish only after every asset is attached and verified. Once
+          # published the release is immutable, so a draft is the last state in
+          # which a retry can still change anything.
+          gh release edit "$RELEASE_TAG" --draft=false --latest
+          [ "$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft')" = "false" ] || {
+            echo "::error::GitHub Release $RELEASE_TAG is still a draft after publish"
+            exit 1
+          }
+          echo "published $RELEASE_TAG with $(printf '%s\n' "$ASSETS" | grep -c . ) verified assets"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,499 @@
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import {
+  CATALOG_ROUTING_CORRECTIONS,
+  anthropicMediaType,
+  routingCorrectionFor,
+  toAnthropicMessages,
+  callAnthropicCompatible,
+  correctionPreservesConfiguredTransport,
+} from '../lib/catalog-corrections.js'
+import { stripTrailingSlashes } from '../lib/string-normalization.js'
+import { providerTransportFor } from '../lib/live-model-discovery.js'
+import { VISION_FAILURE_KINDS } from '../lib/vision-resilience.js'
+
+const brokenFacts = { api: 'openai-completions', baseUrl: 'https://opencode.ai/zen/go/v1' }
+const fixedFacts = { api: 'anthropic-messages', baseUrl: 'https://opencode.ai/zen/go' }
+
+test('the opencode-go corrections cover the reported pairs', () => {
+  const entries = CATALOG_ROUTING_CORRECTIONS.filter((entry) => entry.provider === 'opencode-go')
+  assert.deepEqual(
+    entries.map((entry) => [entry.model, entry.api, entry.baseURL]),
+    [
+      ['qwen3.6-plus', 'anthropic-messages', 'https://opencode.ai/zen/go'],
+      ['minimax-m2.7', 'anthropic-messages', 'https://opencode.ai/zen/go'],
+    ],
+  )
+})
+
+test('a correction engages only for the exact broken catalog configuration', () => {
+  assert.equal(
+    routingCorrectionFor(brokenFacts, 'opencode-go', 'qwen3.6-plus').api,
+    'anthropic-messages',
+  )
+  assert.equal(
+    routingCorrectionFor(brokenFacts, 'opencode-go', 'minimax-m2.7').api,
+    'anthropic-messages',
+  )
+  // Upstream fixed the catalog: stand down.
+  assert.equal(routingCorrectionFor(fixedFacts, 'opencode-go', 'qwen3.6-plus'), undefined)
+  // Not a pair this correction documents.
+  assert.equal(routingCorrectionFor(brokenFacts, 'opencode-go', 'kimi-k2.6'), undefined)
+  assert.equal(routingCorrectionFor(brokenFacts, 'other-provider', 'qwen3.6-plus'), undefined)
+  // Broken in a different way (another protocol): not ours to fix.
+  assert.equal(
+    routingCorrectionFor(
+      { api: 'openai-responses', baseUrl: 'https://opencode.ai/zen/go/v1' },
+      'opencode-go',
+      'qwen3.6-plus',
+    ),
+    undefined,
+  )
+  // A user route pointed at their own gateway keeps its own routing.
+  assert.equal(
+    routingCorrectionFor(
+      { api: 'openai-completions', baseUrl: 'https://my-gateway.example/v1' },
+      'opencode-go',
+      'qwen3.6-plus',
+    ),
+    undefined,
+  )
+  // Unknown catalog facts fail closed (no interception).
+  assert.equal(routingCorrectionFor(undefined, 'opencode-go', 'qwen3.6-plus'), undefined)
+  assert.equal(routingCorrectionFor({ api: '' }, 'opencode-go', 'qwen3.6-plus'), undefined)
+  // The settings switch disables every correction.
+  assert.equal(routingCorrectionFor(brokenFacts, 'opencode-go', 'qwen3.6-plus', false), undefined)
+})
+
+test('catalog correction never hijacks a custom or lookalike Host gateway', () => {
+  // The previous baseUrl.includes('opencode.ai/zen/go') matched arbitrary
+  // hostnames, embedded URL fragments, queries and unsupported nested paths.
+  // A corrected route uses the credential resolved for the *original* pair,
+  // so overriding a custom gateway also changes the credential destination.
+  const maliciousOrCustom = [
+    'https://notopencode.ai/zen/go/v1',
+    'https://example.test/redirect/opencode.ai/zen/go/v1',
+    'https://example.test/?next=opencode.ai/zen/go/v1',
+    'http://opencode.ai/zen/go/v1',
+    'https://opencode.ai/zen/go/v1/chat/completions',
+    'https://opencode.ai/zen/go.evil/v1',
+    'https://opencode.ai/zen/go/v1?shadow=1',
+    'https://user@opencode.ai/zen/go/v1',
+    'not a URL opencode.ai/zen/go',
+  ]
+  for (const baseUrl of maliciousOrCustom) {
+    assert.equal(
+      routingCorrectionFor({ api: 'openai-completions', baseUrl },
+        'opencode-go', 'qwen3.6-plus'),
+      undefined,
+      `must not intercept ${baseUrl}`,
+    )
+  }
+
+  for (const baseUrl of [
+    'https://opencode.ai/zen/go',
+    'https://opencode.ai/zen/go/',
+    'https://opencode.ai/zen/go/v1',
+    'https://OPENCODE.AI/zen/go/v1/',
+  ]) {
+    assert.equal(
+      routingCorrectionFor({ api: 'openai-completions', baseUrl },
+        'opencode-go', 'qwen3.6-plus')?.api,
+      'anthropic-messages',
+      `official route must stay supported: ${baseUrl}`,
+    )
+  }
+})
+
+test('catalog correction must also respect current Host transport overrides', () => {
+  const entry = routingCorrectionFor(brokenFacts, 'opencode-go', 'qwen3.6-plus')
+  assert.ok(entry)
+  for (const profile of [
+    { baseURL: 'https://custom.example/v1' },
+    { baseUrl: 'https://notopencode.ai/zen/go/v1' },
+    { baseURL: 'https://opencode.ai/zen/go/v1?relay=1' },
+    { baseURL: 'https://opencode.ai/zen/go/v1#fragment' },
+    { api: 'anthropic-messages' },
+    { api: 'openai-responses' },
+    { baseURL: 123 },
+  ]) {
+    assert.equal(
+      correctionPreservesConfiguredTransport(entry, profile),
+      false,
+      JSON.stringify(profile),
+    )
+  }
+  for (const profile of [
+    { baseURL: 'https://opencode.ai/zen/go', api: 'openai-completions' },
+    { baseUrl: 'https://opencode.ai/zen/go/v1/' },
+    { baseURL: 'https://OPENCODE.AI/zen/go/v1', apiKeyEnv: 'OPENCODE_API_KEY' },
+  ]) {
+    assert.equal(correctionPreservesConfiguredTransport(entry, profile), true)
+  }
+  assert.equal(
+    correctionPreservesConfiguredTransport(
+      entry,
+      { baseURL: 'https://opencode.ai/zen/go/v1' },
+      { baseURL: 'https://custom.example/v1' },
+    ),
+    false,
+    'a custom Host setting overrides official catalog evidence',
+  )
+  assert.equal(correctionPreservesConfiguredTransport(entry), true,
+    'unconfigured official catalog still follows existing compatibility behavior')
+  assert.equal(correctionPreservesConfiguredTransport(undefined), false)
+})
+
+test('Host ConfigEditor overrides official catalog route without overriding native provider ownership', () => {
+  const ctx = {
+    get(name) {
+      if (name === 'settings') return { get() { return undefined } }
+      if (name === 'configEditor') return {
+        configuration() {
+          return [{
+            entry: { options: { id: 'llm-pi-ai' } },
+            inherited: {
+              providers: {
+                'opencode-go': { baseURL: 'https://opencode.ai/zen/go/v1', api: 'openai-completions' },
+              },
+            },
+            override: {
+              providers: {
+                'opencode-go': { baseURL: 'https://custom-relay.example/v1', api: 'openai-completions' },
+              },
+            },
+          }]
+        },
+      }
+      return undefined
+    },
+    llm: {
+      registration() {
+        return {
+          adapter: {
+            config: {
+              profiles() {
+                return new Map([['opencode-go', {
+                  baseURL: 'https://opencode.ai/zen/go/v1',
+                  // The pi provider owns a map of API implementation handlers,
+                  // NOT one chosen wire-protocol string.
+                  piProvider: {
+                    baseUrl: 'https://opencode.ai/zen/go/v1',
+                    api: { 'openai-completions': {}, 'anthropic-messages': {} },
+                    getModels() { return [{ id: 'qwen3.6-plus', ...brokenFacts }] },
+                  },
+                }]])
+              },
+            },
+          },
+        }
+      },
+    },
+  }
+  const correction = routingCorrectionFor(brokenFacts, 'opencode-go', 'qwen3.6-plus')
+  const host = providerTransportFor(ctx, 'opencode-go')
+  assert.equal(host?.baseURL, 'https://custom-relay.example/v1')
+  assert.equal(correctionPreservesConfiguredTransport(correction, host), false)
+
+  const piProfile = ctx.llm.registration().adapter.config.profiles().get('opencode-go')
+  assert.equal(correctionPreservesConfiguredTransport(
+    correction,
+    { baseUrl: piProfile.piProvider.baseUrl },
+    { baseURL: 'https://opencode.ai/zen/go/v1', api: 'openai-completions' },
+  ), true, 'provider API handler map must not be mistaken for configured protocol')
+})
+
+test('anthropicMediaType normalizes jpg to jpeg and passes others through', () => {
+  assert.equal(anthropicMediaType('image/jpg'), 'image/jpeg')
+  assert.equal(anthropicMediaType('image/png'), 'image/png')
+  assert.equal(anthropicMediaType(''), '')
+})
+
+test('stripTrailingSlashes handles adversarial slash runs without backtracking semantics', () => {
+  assert.equal(stripTrailingSlashes(''), '')
+  assert.equal(stripTrailingSlashes('////'), '')
+  assert.equal(stripTrailingSlashes('https://example.test/v1／'), 'https://example.test/v1／')
+
+  const trailing = `https://example.test${'/'.repeat(100_000)}`
+  assert.equal(stripTrailingSlashes(trailing), 'https://example.test')
+
+  const nonTrailing = `https://example.test/${'/'.repeat(100_000)}x`
+  assert.equal(stripTrailingSlashes(nonTrailing), nonTrailing)
+})
+
+test('toAnthropicMessages builds system, merges roles, and maps blocks', async () => {
+  const bytesOf = async (attachment) => {
+    assert.equal(attachment.attachmentId, 'img-1')
+    return Buffer.from([1, 2, 3])
+  }
+  const result = await toAnthropicMessages(
+    [
+      {
+        role: 'system',
+        content: [
+          { type: 'text', text: 'You are helpful.' },
+          { type: 'text', text: 'Be concise.' },
+        ],
+      },
+      {
+        role: 'user',
+        content: [
+          { type: 'image', attachment: { attachmentId: 'img-1', mediaType: 'image/jpg' } },
+          { type: 'text', text: 'What is this?' },
+        ],
+      },
+      { role: 'user', content: [{ type: 'text', text: 'Answer briefly.' }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'Sure.' }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'It is a test.' }] },
+    ],
+    bytesOf,
+  )
+  assert.equal(result.system, 'You are helpful.\nBe concise.')
+  assert.equal(result.messages.length, 2)
+  assert.deepEqual(result.messages[0].role, 'user')
+  assert.equal(result.messages[0].content.length, 3)
+  assert.deepEqual(result.messages[0].content[0], {
+    type: 'image',
+    source: { type: 'base64', media_type: 'image/jpeg', data: Buffer.from([1, 2, 3]).toString('base64') },
+  })
+  assert.equal(result.messages[1].role, 'assistant')
+  assert.equal(result.messages[1].content.length, 2)
+})
+
+test('toAnthropicMessages maps tool calls and tool results, skips reasoning', async () => {
+  const result = await toAnthropicMessages(
+    [
+      {
+        role: 'assistant',
+        content: [
+          { type: 'reasoning', text: 'private chain of thought' },
+          { type: 'tool-call', id: 'call-1', name: 'vision_describe', arguments: '{"question":"hi"}' },
+        ],
+      },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'tool-result',
+            toolCallId: 'call-1',
+            content: [{ type: 'text', text: 'result text' }],
+          },
+        ],
+      },
+    ],
+    async () => Buffer.alloc(0),
+  )
+  assert.equal(result.system, '')
+  // The wire must open with a user message, so the guard prepends a marker.
+  assert.equal(result.messages.length, 3)
+  assert.deepEqual(result.messages[0], {
+    role: 'user',
+    content: [{ type: 'text', text: '(conversation history)' }],
+  })
+  assert.deepEqual(result.messages[1].content, [
+    { type: 'tool_use', id: 'call-1', name: 'vision_describe', input: { question: 'hi' } },
+  ])
+  assert.deepEqual(result.messages[2].content, [
+    { type: 'tool_result', tool_use_id: 'call-1', content: [{ type: 'text', text: 'result text' }] },
+  ])
+})
+
+test('toAnthropicMessages preserves DSH image-offload decisions without reading image bytes', async () => {
+  let reads = 0
+  const result = await toAnthropicMessages(
+    [
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'image',
+            offloaded: true,
+            attachment: { attachmentId: 'sha256:0123456789abcdef', mediaType: 'image/png' },
+          },
+          { type: 'text', text: 'continue from the retained context' },
+        ],
+      },
+    ],
+    async () => {
+      reads += 1
+      return Buffer.from([1, 2, 3])
+    },
+  )
+  assert.equal(reads, 0, 'an offloaded occurrence must never resolve or resend attachment bytes')
+  assert.equal(result.messages.length, 1)
+  assert.equal(result.messages[0].content[0].type, 'text')
+  assert.match(result.messages[0].content[0].text, /image omitted to fit request image limits/)
+  assert.match(result.messages[0].content[0].text, /sha256:0123456789abcdef/)
+  assert.deepEqual(result.messages[0].content[1], { type: 'text', text: 'continue from the retained context' })
+})
+
+test('toAnthropicMessages drops unreadable images instead of failing', async () => {
+  const result = await toAnthropicMessages(
+    [
+      {
+        role: 'user',
+        content: [
+          { type: 'image', attachment: { attachmentId: 'boom' } },
+          { type: 'text', text: 'kept' },
+        ],
+      },
+    ],
+    async () => {
+      throw new Error('unreadable')
+    },
+  )
+  assert.deepEqual(result.messages, [{ role: 'user', content: [{ type: 'text', text: 'kept' }] }])
+})
+
+test('toAnthropicMessages opens with a user message even when history starts with the assistant', async () => {
+  const result = await toAnthropicMessages(
+    [
+      { role: 'assistant', content: [{ type: 'text', text: 'already done.' }] },
+      { role: 'user', content: [{ type: 'text', text: 'what next?' }] },
+    ],
+    async () => Buffer.alloc(0),
+  )
+  assert.equal(result.messages[0].role, 'user')
+  assert.deepEqual(result.messages[0].content, [{ type: 'text', text: '(conversation history)' }])
+  assert.equal(result.messages[1].role, 'assistant')
+})
+
+test('toAnthropicMessages ignores image_url blocks without attachment refs (main behavior preserved)', async () => {
+  // The local vision merge does not extend the correction path's block
+  // conversion: image_url-only content (no attachment ref) is skipped, and
+  // attachment-backed image blocks read through bytesOf as in main.
+  const result = await toAnthropicMessages(
+    [
+      {
+        role: 'user',
+        content: [
+          { type: 'image_url', image_url: { url: 'data:image/jpeg;base64,/9j/4AAQSkZJRg==' } },
+          { type: 'text', text: 'what is this?' },
+        ],
+      },
+    ],
+    async () => {
+      throw new Error('no attachment reads expected for image_url-only content')
+    },
+  )
+  assert.equal(result.system, '')
+  assert.equal(result.messages.length, 1)
+  assert.deepEqual(result.messages[0].content, [{ type: 'text', text: 'what is this?' }])
+})
+
+test('toAnthropicMessages folds plain string content into a text block (main behavior)', async () => {
+  // main's conversion handles string content only for non-user/assistant
+  // roles; a user string goes through convertBlocks and is dropped when no
+  // block conversion applies (no array, no attachment). The local vision
+  // merge must not extend this behavior.
+  const result = await toAnthropicMessages([{ role: 'user', content: 'hello there' }])
+  assert.equal(result.messages.length, 0)
+})
+
+test('callAnthropicCompatible posts /v1/messages with anthropic auth and parses text', async () => {
+  const original = globalThis.fetch
+  let captured
+  globalThis.fetch = async (url, init) => {
+    captured = { url: String(url), headers: init.headers, body: JSON.parse(init.body) }
+    return new Response(
+      JSON.stringify({
+        content: [{ type: 'text', text: 'Hello' }, { type: 'text', text: ' world' }],
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    )
+  }
+  try {
+    const text = await callAnthropicCompatible(
+      { name: 'opencode-go', baseURL: 'https://opencode.ai/zen/go/', model: 'qwen3.6-plus' },
+      [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      { maxTokens: 1024, apiKey: 'secret', system: 'be terse', sessionId: 'session-catalog-test' },
+    )
+    assert.equal(text, 'Hello world')
+    assert.equal(captured.url, 'https://opencode.ai/zen/go/v1/messages')
+    assert.equal(captured.headers['x-api-key'], 'secret')
+    assert.equal(captured.headers['anthropic-version'], '2023-06-01')
+    assert.equal(captured.headers['x-opencode-session'], 'session-catalog-test')
+    assert.equal(captured.body.model, 'qwen3.6-plus')
+    assert.equal(captured.body.max_tokens, 1024)
+    assert.equal(captured.body.system, 'be terse')
+    assert.deepEqual(captured.body.messages, [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }])
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+test('callAnthropicCompatible types 429 with retry-after like the OpenAI client', async () => {
+  const original = globalThis.fetch
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ error: { message: 'slow down' } }), {
+      status: 429,
+      headers: { 'content-type': 'application/json', 'retry-after': '3' },
+    })
+  try {
+    await assert.rejects(
+      callAnthropicCompatible(
+        { name: 'opencode-go', baseURL: 'https://opencode.ai/zen/go', model: 'qwen3.6-plus' },
+        [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+        { maxTokens: 1024, apiKey: 'secret', sessionId: 'session-catalog-test' },
+      ),
+      (error) => {
+        assert.equal(error.status, 429)
+        assert.equal(error.code, VISION_FAILURE_KINDS.RATE_LIMIT)
+        assert.equal(error.providerRetryAfterMs, 3000)
+        return true
+      },
+    )
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+test('callAnthropicCompatible refuses a missing key and empty content', async () => {
+  await assert.rejects(
+    callAnthropicCompatible(
+      { name: 'opencode-go', baseURL: 'https://opencode.ai/zen/go', model: 'qwen3.6-plus' },
+      [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      { maxTokens: 1024 },
+    ),
+    /api key is not set/,
+  )
+  const original = globalThis.fetch
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ content: [] }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  try {
+    await assert.rejects(
+      callAnthropicCompatible(
+        { name: 'opencode-go', baseURL: 'https://opencode.ai/zen/go', model: 'qwen3.6-plus' },
+        [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+        { maxTokens: 1024, apiKey: 'secret', sessionId: 'session-catalog-test' },
+      ),
+      /no text content/,
+    )
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+
+test('batch3: Anthropic success admission rejects oversized bodies', async () => {
+  const original = globalThis.fetch
+  globalThis.fetch = async () => new Response('{"content":[]}', {
+    status: 200,
+    headers: { 'content-type': 'application/json', 'content-length': String(5 * 1024 * 1024) },
+  })
+  try {
+    await assert.rejects(
+      callAnthropicCompatible(
+        { name: 'local', baseURL: 'http://127.0.0.1:1234', model: 'm', apiKeyEnv: '' },
+        [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+        { allowKeyless: true },
+      ),
+      (error) => error && error.code === 'HTTP_RESPONSE_TOO_LARGE',
+    )
+  } finally {
+    globalThis.fetch = original
+  }
+})

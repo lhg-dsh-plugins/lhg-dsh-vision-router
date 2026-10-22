@@ -1,0 +1,258 @@
+name: DSH exact source contract
+
+on:
+  pull_request:
+    paths:
+      - 'cordis.patch.yml'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - 'src/**'
+      - 'src/lib/dsh-support-window.js'
+      - 'src/lib/adapter-update-coalescer.js'
+      - 'src/lib/client-host-compat-prelude.js'
+      - 'src/lib/client-presentation-boundary.js'
+      - 'src/lib/*-client-prelude.js'
+      - 'src/lib/vision-model-visibility-boundary-main.js'
+      - 'src/lib/vision-model-visibility-boundary.js'
+      - 'src/lib/client-presentation-boundary-main.js'
+      - 'src/lib/settings-factory-lifecycle.js'
+      - 'src/lib/settings-ia-client-prelude.js'
+      - 'src/lib/vision-provider-transport.ts'
+      - 'src/lib/legacy-global-proxy-boundary.js'
+      - 'src/lib/proxy-routing.ts'
+      - 'src/lib/settings-limit-client-prelude.js'
+      - 'src/lib/remote-settings-bridge.js'
+      - 'src/lib/web/**'
+      - 'src/lib/dsh-contract-compat.js'
+      - 'src/lib/web-capability-boundary.js'
+      - 'src/lib/client.js'
+      - 'src/lib/guide-vision-toggle-highlight.js'
+      - 'src/lib/remote-settings-risk-confirmation.js'
+      - 'src/lib/settings-client-loader-lifecycle.js'
+      - 'src/lib/settings-native-card-layout.js'
+      - 'src/lib/v2-settings-ia-integration.js'
+      - 'src/lib/vision-capability-benchmark-client.js'
+      - 'src/lib/vision-exact-check-client.js'
+      - 'src/lib/vision-routing-settings-prelude.js'
+      - 'scripts/dsh-proxy-egress-contract.mjs'
+      - 'scripts/dsh-peer-admission-contract.mjs'
+      - 'scripts/dsh-alpha-source-contract.mjs'
+      - 'scripts/dsh-web-modules-overlay-contract.mjs'
+      - 'scripts/dsh-web-connection-overlay-contract.mjs'
+      - 'docs/architecture/host-first-proxy-convergence.md'
+      - 'tests/adapter-prepare-call-compat.test.js'
+      - 'tests/dsh-host-compat.test.js'
+      - 'tests/alpha1-*.test.js'
+      - 'tests/attachment-admission-policy.test.js'
+      - 'tests/clipboard-image-paste-compat.test.js'
+      - 'tests/client-presentation-boundary.test.js'
+      - 'scripts/build-source-artifacts.mjs'
+      - '.github/workflows/dsh-alpha-source-contract.yml'
+  push:
+    branches: [main, 2.3.0]
+    paths:
+      - 'cordis.patch.yml'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - 'src/**'
+      - 'src/lib/dsh-support-window.js'
+      - 'src/lib/adapter-update-coalescer.js'
+      - 'src/lib/client-host-compat-prelude.js'
+      - 'src/lib/client-presentation-boundary.js'
+      - 'src/lib/*-client-prelude.js'
+      - 'src/lib/vision-model-visibility-boundary-main.js'
+      - 'src/lib/vision-model-visibility-boundary.js'
+      - 'src/lib/client-presentation-boundary-main.js'
+      - 'src/lib/settings-factory-lifecycle.js'
+      - 'src/lib/settings-ia-client-prelude.js'
+      - 'src/lib/vision-provider-transport.ts'
+      - 'src/lib/legacy-global-proxy-boundary.js'
+      - 'src/lib/proxy-routing.ts'
+      - 'src/lib/settings-limit-client-prelude.js'
+      - 'src/lib/remote-settings-bridge.js'
+      - 'src/lib/web/**'
+      - 'src/lib/dsh-contract-compat.js'
+      - 'src/lib/web-capability-boundary.js'
+      - 'src/lib/client.js'
+      - 'src/lib/guide-vision-toggle-highlight.js'
+      - 'src/lib/remote-settings-risk-confirmation.js'
+      - 'src/lib/settings-client-loader-lifecycle.js'
+      - 'src/lib/settings-native-card-layout.js'
+      - 'src/lib/v2-settings-ia-integration.js'
+      - 'src/lib/vision-capability-benchmark-client.js'
+      - 'src/lib/vision-exact-check-client.js'
+      - 'src/lib/vision-routing-settings-prelude.js'
+      - 'scripts/dsh-proxy-egress-contract.mjs'
+      - 'scripts/dsh-peer-admission-contract.mjs'
+      - 'scripts/dsh-alpha-source-contract.mjs'
+      - 'scripts/dsh-web-modules-overlay-contract.mjs'
+      - 'scripts/dsh-web-connection-overlay-contract.mjs'
+      - 'docs/architecture/host-first-proxy-convergence.md'
+      - 'tests/adapter-prepare-call-compat.test.js'
+      - 'tests/dsh-host-compat.test.js'
+      - 'tests/alpha1-*.test.js'
+      - 'tests/attachment-admission-policy.test.js'
+      - 'tests/clipboard-image-paste-compat.test.js'
+      - 'tests/client-presentation-boundary.test.js'
+      - 'scripts/build-source-artifacts.mjs'
+      - '.github/workflows/dsh-alpha-source-contract.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  exact-source-contract:
+    name: DSH ${{ matrix.dsh }} source / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            dsh: 0.1.5-rc.1
+          - os: macos-latest
+            dsh: 0.1.5-rc.1
+          - os: windows-latest
+            dsh: 0.1.5-rc.1
+          - os: ubuntu-latest
+            dsh: 0.1.5-rc.3
+          - os: macos-latest
+            dsh: 0.1.5-rc.3
+          - os: windows-latest
+            dsh: 0.1.5-rc.3
+          - os: ubuntu-latest
+            dsh: 0.1.7-rc.2
+          - os: macos-latest
+            dsh: 0.1.7-rc.2
+          - os: windows-latest
+            dsh: 0.1.7-rc.2
+    steps:
+      - name: Checkout Vision Router
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          path: dvr
+
+      - name: Checkout exact DSH 0.1.5-rc.1 source
+        if: matrix.dsh == '0.1.5-rc.1'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: deepseek-ai/deepseek-harness
+          ref: 183f08e9c6dde7e36cd2318eaee70b0da08fb35e
+          persist-credentials: false
+          path: dsh-exact
+
+      - name: Checkout exact DSH 0.1.5-rc.3 source
+        if: matrix.dsh == '0.1.5-rc.3'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: deepseek-ai/deepseek-harness
+          ref: a4c74a91e06b00fe0b0937bde982170c526cc842
+          persist-credentials: false
+          path: dsh-exact
+
+      - name: Checkout exact DSH 0.1.7-rc.2 source
+        if: matrix.dsh == '0.1.7-rc.2'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: deepseek-ai/deepseek-harness
+          ref: 477b4f420553e8a52c2fbccc464d7561b239c443
+          persist-credentials: false
+          path: dsh-exact
+
+      - name: Install exact Host package manager
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 11.7.0
+
+      - name: Install Node 22 contract runtime
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22.19.0
+
+      - name: Materialize Vision Router package artifacts
+        working-directory: dvr
+        run: |
+          pnpm install --frozen-lockfile --ignore-scripts
+          pnpm build
+          pnpm build:check
+      - name: Install exact Host workspace dependencies
+        working-directory: dsh-exact
+        env:
+          CI: 'true'
+          LEFTHOOK: '0'
+        run: pnpm install --frozen-lockfile
+
+      - name: Run Vision Router against exact 0.1.5-rc.1 source contracts
+        if: matrix.dsh == '0.1.5-rc.1'
+        working-directory: dsh-exact
+        env:
+          DSH_SOURCE_ROOT: ${{ github.workspace }}/dsh-exact
+          DSH_EXPECTED_VERSION: 0.1.5-rc.1
+          DSH_EXPECTED_COMMIT: 183f08e9c6dde7e36cd2318eaee70b0da08fb35e
+        run: pnpm exec tsx ../dvr/scripts/dsh-alpha-source-contract.mjs
+
+      - name: Run Vision Router against exact 0.1.5-rc.3 source contracts
+        if: matrix.dsh == '0.1.5-rc.3'
+        working-directory: dsh-exact
+        env:
+          DSH_SOURCE_ROOT: ${{ github.workspace }}/dsh-exact
+          DSH_EXPECTED_VERSION: 0.1.5-rc.3
+          DSH_EXPECTED_COMMIT: a4c74a91e06b00fe0b0937bde982170c526cc842
+        run: pnpm exec tsx ../dvr/scripts/dsh-alpha-source-contract.mjs
+
+      - name: Run Vision Router against exact 0.1.7-rc.2 source contracts
+        if: matrix.dsh == '0.1.7-rc.2'
+        working-directory: dsh-exact
+        env:
+          DSH_SOURCE_ROOT: ${{ github.workspace }}/dsh-exact
+          DSH_EXPECTED_VERSION: 0.1.7-rc.2
+          DSH_EXPECTED_COMMIT: 477b4f420553e8a52c2fbccc464d7561b239c443
+        run: pnpm exec tsx ../dvr/scripts/dsh-alpha-source-contract.mjs
+
+      - name: Verify DVR 0.2.x peer admission with DSH Host evaluator
+        if: matrix.dsh == '0.1.7-rc.2'
+        working-directory: dsh-exact
+        env:
+          DSH_SOURCE_ROOT: ${{ github.workspace }}/dsh-exact
+          DVR_SOURCE_ROOT: ${{ github.workspace }}/dvr
+        run: pnpm exec tsx ../dvr/scripts/dsh-peer-admission-contract.mjs
+
+      - name: Verify Host proxy egress authority for Vision Router
+        working-directory: dsh-exact
+        env:
+          DSH_SOURCE_ROOT: ${{ github.workspace }}/dsh-exact
+          DVR_SOURCE_ROOT: ${{ github.workspace }}/dvr
+        run: pnpm exec tsx ../dvr/scripts/dsh-proxy-egress-contract.mjs
+
+      - name: Assert modules -> webServer compatibility overlay still belongs to DVR
+        working-directory: dsh-exact
+        env:
+          DSH_SOURCE_ROOT: ${{ github.workspace }}/dsh-exact
+          DSH_MODULES_WEBSERVER_EXPECTED: shim-required
+        run: pnpm exec tsx ../dvr/scripts/dsh-web-modules-overlay-contract.mjs
+
+      - name: Assert connection -> webServer compatibility overlay still belongs to DVR
+        working-directory: dsh-exact
+        env:
+          DSH_SOURCE_ROOT: ${{ github.workspace }}/dsh-exact
+          DSH_CONNECTION_WEBSERVER_EXPECTED: shim-required
+        run: pnpm exec tsx ../dvr/scripts/dsh-web-connection-overlay-contract.mjs
+
+      - name: Run DVR release-family compatibility unit contracts
+        working-directory: dvr
+        run: >-
+          node --test
+          tests/adapter-prepare-call-compat.test.js
+          tests/alpha1-client-host-compat.test.js
+          tests/alpha1-settings-factory-lifecycle.test.js
+          tests/alpha1-browser-lifecycle-integration.test.js
+          tests/alpha1-web-auth-boundary.test.js
+          tests/attachment-admission-policy.test.js
+          tests/clipboard-image-paste-compat.test.js
+          tests/client-presentation-boundary.test.js

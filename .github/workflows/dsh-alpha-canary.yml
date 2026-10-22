@@ -1,0 +1,161 @@
+name: Latest DSH Alpha Canary
+
+on:
+  # A compatibility runner change must prove itself against the actual
+  # published alpha package, not merely pass unrelated PR unit tests.
+  pull_request:
+    paths:
+      - '.github/workflows/dsh-alpha-canary.yml'
+      - 'scripts/dsh-preview-native-lifecycle-contract.mjs'
+      - 'scripts/dsh-host-contract-smoke.mjs'
+      - 'tests/opencode-session-wire-contract.mjs'
+  schedule:
+    - cron: '37 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  latest-alpha:
+    name: latest-alpha / Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22', '24']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 11.20.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Resolve latest published DSH alpha
+        shell: bash
+        run: |
+          set -euo pipefail
+          DSH_VERSION="$(npm view @deepseek-ai/dsh dist-tags.alpha)"
+          test -n "$DSH_VERSION"
+          echo "DSH_VERSION=$DSH_VERSION" >> "$GITHUB_ENV"
+          echo "Testing latest published DSH alpha family: $DSH_VERSION"
+      - run: pnpm install --frozen-lockfile
+      - name: Pack plugin
+        run: |
+          mkdir -p tmp-pack
+          pnpm pack --pack-destination tmp-pack
+      - name: Install isolated alpha Host family
+        shell: node {0}
+        run: |
+          const fs = require('node:fs')
+          const path = require('node:path')
+          const { spawnSync } = require('node:child_process')
+          const tgz = fs.readdirSync('tmp-pack').find((name) => name.endsWith('.tgz'))
+          if (!tgz) throw new Error('packed plugin tarball not found')
+          const tarball = path.resolve('tmp-pack', tgz).replaceAll('\\', '/')
+          const v = process.env.DSH_VERSION
+          const hostDir = path.join(process.env.RUNNER_TEMP, `dvr-alpha-${v}-${process.versions.node}`)
+          fs.rmSync(hostDir, { recursive: true, force: true })
+          fs.mkdirSync(hostDir, { recursive: true })
+          fs.writeFileSync(path.join(hostDir, 'package.json'), JSON.stringify({
+            private: true,
+            type: 'module',
+            packageManager: 'pnpm@11.20.0',
+            dependencies: {
+              'dsh-vision-router': `file:${tarball}`,
+              '@deepseek-ai/dsh-anonymous-user-id': v,
+              '@deepseek-ai/dsh-attachment': v,
+              '@deepseek-ai/dsh-attachment-local': v,
+              '@deepseek-ai/dsh-llm': v,
+              '@deepseek-ai/dsh-llm-deepseek': v,
+              '@deepseek-ai/dsh-llm-pi-ai': v,
+              '@deepseek-ai/dsh-settings': v,
+              '@deepseek-ai/dsh-system-prompt': v,
+              '@deepseek-ai/dsh-tools': v,
+              '@deepseek-ai/dsh-session': v,
+              '@deepseek-ai/dsh-session-projection': v,
+              '@deepseek-ai/dsh-session-persistence-jsonl': v,
+              '@deepseek-ai/dsh-agent': v,
+              '@deepseek-ai/dsh-agent-loop': v,
+              '@deepseek-ai/dsh-compaction-image-offload': v,
+              sharp: '0.35.3',
+            },
+          }, null, 2))
+          fs.writeFileSync(path.join(hostDir, 'pnpm-workspace.yaml'), [
+            'packages:',
+            '  - .',
+            'allowBuilds:',
+            '  koffi: true',
+            '  fs-ext: true',
+            "  '@google/genai': true",
+            '  protobufjs: true',
+            '',
+          ].join('\n'))
+          const installed = spawnSync('pnpm', ['install'], { cwd: hostDir, stdio: 'inherit' })
+          if (installed.status !== 0) process.exit(installed.status ?? 1)
+          fs.appendFileSync(process.env.GITHUB_ENV, `DSH_CONTRACT_HOST_DIR=${hostDir}\n`)
+      # Every contract runs even when an earlier one fails, and one aggregate step
+      # reports them together: a single stale expectation must not hide the state of
+      # the other contracts on a new upstream alpha.
+      - name: Verify alpha Host capability contract
+        id: alpha-host-capability
+        continue-on-error: true
+        env:
+          EXPECT_BATCH: 'true'
+          EXPECT_DIMENSION: 'true'
+          EXPECT_CURRENT: 'true'
+          # The seam is read from the Host, so a release that swaps the settings
+          # surface again is reported as a contract change instead of an expectation.
+          EXPECT_SETTINGS_MODE: auto
+        run: node scripts/dsh-host-contract-smoke.mjs
+      - name: Verify alpha pi-ai final OpenCode wire
+        id: alpha-pi-ai-wire
+        continue-on-error: true
+        run: node tests/opencode-session-wire-contract.mjs
+      - name: Verify alpha Session v2 native image process-restart lifecycle
+        id: alpha-native-lifecycle
+        continue-on-error: true
+        run: node scripts/dsh-preview-native-lifecycle-contract.mjs
+      - name: Require every alpha contract
+        if: always()
+        run: |
+          failed=''
+          for entry in \
+            "Host capability:${{ steps.alpha-host-capability.outcome }}" \
+            "pi-ai wire:${{ steps.alpha-pi-ai-wire.outcome }}" \
+            "native lifecycle:${{ steps.alpha-native-lifecycle.outcome }}"; do
+            name="${entry%%:*}"
+            outcome="${entry##*:}"
+            printf '  %-18s %s\n' "$name" "$outcome"
+            [ "$outcome" = 'success' ] || failed="$failed $name"
+          done
+          {
+            echo "### Alpha contracts against @deepseek-ai/dsh ${DSH_VERSION}"
+            echo
+            echo "| contract | outcome |"
+            echo '| --- | --- |'
+            echo "| Host capability | ${{ steps.alpha-host-capability.outcome }} |"
+            echo "| pi-ai wire | ${{ steps.alpha-pi-ai-wire.outcome }} |"
+            echo "| native lifecycle | ${{ steps.alpha-native-lifecycle.outcome }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$failed" ]; then
+            echo "::error::alpha contracts failed:$failed"
+            exit 1
+          fi
+          echo "all alpha contracts passed against @deepseek-ai/dsh ${DSH_VERSION}"
+      - name: Compatibility investigation hint
+        if: failure()
+        run: |
+          {
+            echo '## Latest DSH alpha compatibility investigation required'
+            echo
+            echo "The scheduled canary failed against @deepseek-ai/dsh ${DSH_VERSION}."
+            echo 'Do not advance the exact preview verification evidence until the failing Host/wire/lifecycle contract is understood.'
+          } >> "$GITHUB_STEP_SUMMARY"

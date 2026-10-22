@@ -1,0 +1,201 @@
+name: P2 Data Boundary
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'src/entry.js'
+      - 'src/index.js'
+      - 'src/lib/artifact-*.js'
+      - 'src/lib/vision-artifact-store.js'
+      - 'src/lib/vision-tool-runtime-boundary.js'
+      - 'src/lib/adversarial-hardening.js'
+      - 'src/lib/session-surface-policy.js'
+      - 'src/lib/session-vision-state.ts'
+      - 'src/lib/session-vision-index.js'
+      - 'src/lib/native-image-coexistence.js'
+      - 'src/lib/legacy-core-vision-policy-bridge.js'
+      - 'src/lib/structured-flow-hardening.js'
+      - 'src/lib/vision-provider-transport.ts'
+      - 'src/lib/proxy-dispatcher-pool.ts'
+      - 'src/lib/proxy-routing.ts'
+      - 'src/lib/vision-capability-benchmark-service.js'
+      - 'src/lib/legacy-global-proxy-boundary.js'
+      - 'src/lib/http-compat.js'
+      - 'src/lib/catalog-corrections.js'
+      - 'src/lib/public-entry.js'
+      - 'src/lib/vision-background-benchmark.js'
+      - 'docs/architecture/compat-inventory.md'
+      - 'docs/architecture/host-first-proxy-convergence.md'
+      - 'docs/architecture/p2-jobs-feasibility.md'
+      - 'tests/vision-artifact-store.test.js'
+      - 'tests/artifact-path-security.test.js'
+      - 'tests/resource-retention-lifecycle.test.js'
+      - 'tests/p2-exit-gate.test.js'
+      - 'tests/qa-cancellation-publication.test.js'
+      - 'tests/session-surface-policy.test.js'
+      - 'tests/session-vision-state.test.js'
+      - 'tests/session-vision-state-integration.test.js'
+      - 'tests/session-vision-index.test.js'
+      - 'tests/issue-276-entry-policy-bridge.test.js'
+      - 'tests/issue-276-session-image-ownership.test.js'
+      - 'tests/issue-289-native-nonintervention.test.js'
+      - 'tests/vision-provider-transport.test.js'
+      - 'tests/vision-capability-benchmark-service.test.js'
+      - 'tests/legacy-global-proxy-boundary.test.js'
+      - 'tests/http-compat.test.js'
+      - 'tests/vision-background-benchmark.test.js'
+      - 'tests/vision-background-lifecycle.test.js'
+      - '.github/workflows/p2-data-boundary.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'src/entry.js'
+      - 'src/index.js'
+      - 'src/lib/artifact-*.js'
+      - 'src/lib/vision-artifact-store.js'
+      - 'src/lib/vision-tool-runtime-boundary.js'
+      - 'src/lib/adversarial-hardening.js'
+      - 'src/lib/session-surface-policy.js'
+      - 'src/lib/session-vision-state.ts'
+      - 'src/lib/session-vision-index.js'
+      - 'src/lib/native-image-coexistence.js'
+      - 'src/lib/legacy-core-vision-policy-bridge.js'
+      - 'src/lib/structured-flow-hardening.js'
+      - 'src/lib/vision-provider-transport.ts'
+      - 'src/lib/proxy-dispatcher-pool.ts'
+      - 'src/lib/proxy-routing.ts'
+      - 'src/lib/vision-capability-benchmark-service.js'
+      - 'src/lib/legacy-global-proxy-boundary.js'
+      - 'src/lib/http-compat.js'
+      - 'src/lib/catalog-corrections.js'
+      - 'src/lib/public-entry.js'
+      - 'src/lib/vision-background-benchmark.js'
+      - 'docs/architecture/compat-inventory.md'
+      - 'docs/architecture/host-first-proxy-convergence.md'
+      - 'docs/architecture/p2-jobs-feasibility.md'
+      - 'tests/vision-artifact-store.test.js'
+      - 'tests/artifact-path-security.test.js'
+      - 'tests/resource-retention-lifecycle.test.js'
+      - 'tests/p2-exit-gate.test.js'
+      - 'tests/qa-cancellation-publication.test.js'
+      - 'tests/session-surface-policy.test.js'
+      - 'tests/session-vision-state.test.js'
+      - 'tests/session-vision-state-integration.test.js'
+      - 'tests/session-vision-index.test.js'
+      - 'tests/issue-276-entry-policy-bridge.test.js'
+      - 'tests/issue-276-session-image-ownership.test.js'
+      - 'tests/issue-289-native-nonintervention.test.js'
+      - 'tests/vision-provider-transport.test.js'
+      - 'tests/vision-capability-benchmark-service.test.js'
+      - 'tests/legacy-global-proxy-boundary.test.js'
+      - 'tests/http-compat.test.js'
+      - 'tests/vision-background-benchmark.test.js'
+      - 'tests/vision-background-lifecycle.test.js'
+      - '.github/workflows/p2-data-boundary.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  artifact-boundary:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413
+        with:
+          version: 11.20.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Artifact facade parity, lifecycle safety and P2 exit stress
+        run: >-
+          node --test
+          tests/vision-artifact-store.test.js
+          tests/artifact-path-security.test.js
+          tests/resource-retention-lifecycle.test.js
+          tests/p2-exit-gate.test.js
+          tests/qa-cancellation-publication.test.js
+
+  session-surface:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413
+        with:
+          version: 11.20.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Session surface, index, resume and ownership parity
+        run: >-
+          node --test
+          tests/session-surface-policy.test.js
+          tests/session-vision-state.test.js
+          tests/session-vision-state-integration.test.js
+          tests/session-vision-index.test.js
+          tests/issue-276-entry-policy-bridge.test.js
+          tests/issue-276-session-image-ownership.test.js
+          tests/issue-289-native-nonintervention.test.js
+
+  provider-transport:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413
+        with:
+          version: 11.20.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Router-owned provider HTTP and legacy proxy narrowing
+        run: >-
+          node --test
+          tests/vision-provider-transport.test.js
+          tests/legacy-global-proxy-boundary.test.js
+          tests/vision-capability-benchmark-service.test.js
+          tests/http-compat.test.js
+
+  jobs-feasibility:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413
+        with:
+          version: 11.20.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Current scheduler authority, preemption and lifecycle evidence
+        run: >-
+          node --test
+          tests/vision-background-benchmark.test.js
+          tests/vision-background-lifecycle.test.js

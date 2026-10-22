@@ -1,0 +1,160 @@
+name: DSH Contract
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, 2.3.0]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  contract:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: minimum-contract
+            dsh: 0.1.5-rc.1
+            batch: 'true'
+            dimension: 'true'
+            current: 'true'
+            session_event_read: 'true'
+            session_log_read: 'true'
+            image_offload: 'false'
+            settings_mode: native-register
+          - name: current-contract
+            dsh: 0.1.5-rc.3
+            batch: 'true'
+            dimension: 'true'
+            current: 'true'
+            session_event_read: 'true'
+            session_log_read: 'true'
+            image_offload: 'false'
+            settings_mode: native-register
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 11.20.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '22'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Pack plugin
+        run: |
+          mkdir -p tmp-pack
+          pnpm pack --pack-destination tmp-pack
+      - name: Install isolated Host fixture
+        shell: node {0}
+        env:
+          DSH_VERSION: ${{ matrix.dsh }}
+          EXPECT_CURRENT: ${{ matrix.current }}
+          EXPECT_SETTINGS_MODE: ${{ matrix.settings_mode }}
+          EXPECT_SESSION_EVENT_READ: ${{ matrix.session_event_read }}
+          EXPECT_SESSION_LOG_READ: ${{ matrix.session_log_read }}
+          EXPECT_IMAGE_OFFLOAD: ${{ matrix.image_offload }}
+        run: |
+          const fs = require('node:fs')
+          const path = require('node:path')
+          const { spawnSync } = require('node:child_process')
+          const tgz = fs.readdirSync('tmp-pack').find((name) => name.endsWith('.tgz'))
+          if (!tgz) throw new Error('packed plugin tarball not found')
+          const tarball = path.resolve('tmp-pack', tgz).replaceAll('\\', '/')
+          const hostDir = path.join(process.env.RUNNER_TEMP, `dvr-p0-${process.env.DSH_VERSION}`)
+          fs.rmSync(hostDir, { recursive: true, force: true })
+          fs.mkdirSync(hostDir, { recursive: true })
+          const v = process.env.DSH_VERSION
+          const dependencies = {
+            'dsh-vision-router': `file:${tarball}`,
+            '@deepseek-ai/cordis': '4.0.2',
+            '@deepseek-ai/dsh-attachment': v,
+            '@deepseek-ai/dsh-attachment-local': v,
+            '@deepseek-ai/dsh-llm': v,
+            '@deepseek-ai/dsh-llm-deepseek': v,
+            '@deepseek-ai/dsh-anonymous-user-id': v,
+            '@deepseek-ai/dsh-settings': v,
+            sharp: '0.35.3'
+          }
+          if (process.env.EXPECT_SESSION_EVENT_READ === 'true' || process.env.EXPECT_SESSION_LOG_READ === 'true') {
+            dependencies['@deepseek-ai/dsh-session-query'] = v
+          }
+          if (process.env.EXPECT_CURRENT === 'true') {
+            dependencies['@deepseek-ai/dsh-session'] = v
+            dependencies['@deepseek-ai/dsh-tools'] = v
+            dependencies['@deepseek-ai/dsh-system-prompt'] = v
+            dependencies['@deepseek-ai/dsh-llm-pi-ai'] = v
+          }
+          if (process.env.EXPECT_IMAGE_OFFLOAD === 'true') {
+            dependencies['@deepseek-ai/dsh-attachment-local'] = v
+            dependencies['@deepseek-ai/dsh-session-projection'] = v
+            dependencies['@deepseek-ai/dsh-session-persistence-jsonl'] = v
+            dependencies['@deepseek-ai/dsh-agent'] = v
+            dependencies['@deepseek-ai/dsh-agent-loop'] = v
+            dependencies['@deepseek-ai/dsh-compaction-image-offload'] = v
+          }
+          fs.writeFileSync(path.join(hostDir, 'package.json'), JSON.stringify({
+            private: true,
+            type: 'module',
+            packageManager: 'pnpm@11.20.0',
+            dependencies,
+          }, null, 2))
+          if (process.env.EXPECT_CURRENT === 'true') {
+            const allowBuilds = [
+              "  '@google/genai': true",
+              '  protobufjs: true',
+            ]
+            if (process.env.EXPECT_IMAGE_OFFLOAD === 'true') {
+              allowBuilds.unshift('  koffi: true', '  fs-ext: true')
+            }
+            fs.writeFileSync(path.join(hostDir, 'pnpm-workspace.yaml'), [
+              'packages:',
+              '  - .',
+              'allowBuilds:',
+              ...allowBuilds,
+              '',
+            ].join('\n'))
+          }
+          const installed = spawnSync('pnpm', ['install'], { cwd: hostDir, stdio: 'inherit' })
+          if (installed.status !== 0) process.exit(installed.status ?? 1)
+          fs.appendFileSync(process.env.GITHUB_ENV, `HOST_DIR=${hostDir}\n`)
+      - name: Verify Host contract
+        env:
+          EXPECT_BATCH: ${{ matrix.batch }}
+          EXPECT_DIMENSION: ${{ matrix.dimension }}
+          EXPECT_CURRENT: ${{ matrix.current }}
+          EXPECT_SETTINGS_MODE: ${{ matrix.settings_mode }}
+          EXPECT_SESSION_EVENT_READ: ${{ matrix.session_event_read }}
+          EXPECT_SESSION_LOG_READ: ${{ matrix.session_log_read }}
+        run: node scripts/dsh-host-contract-smoke.mjs
+      - name: Verify minimum Host Settings persistence
+        if: matrix.name == 'minimum-contract'
+        env:
+          DSH_MINIMUM_SETTINGS_ROOT: ${{ env.HOST_DIR }}/node_modules/@deepseek-ai/dsh-settings
+        run: node --test tests/minimum-host-settings-persistence.test.js
+      - name: Verify current Vision Router contract surfaces
+        if: matrix.current == 'true'
+        run: |
+          pnpm test:contract
+          node --test tests/session-vision-index.test.js
+          node --test tests/native-image-coexistence.test.js
+      - name: Verify current pi-ai OpenCode Go session wire
+        if: matrix.current == 'true'
+        env:
+          DSH_CONTRACT_HOST_DIR: ${{ env.HOST_DIR }}
+        run: node tests/opencode-session-wire-contract.mjs
+      - name: Verify preview image-offload fork and cold-resume lifecycle
+        if: matrix.image_offload == 'true'
+        env:
+          DSH_CONTRACT_HOST_DIR: ${{ env.HOST_DIR }}
+        run: node scripts/dsh-preview-native-lifecycle-contract.mjs

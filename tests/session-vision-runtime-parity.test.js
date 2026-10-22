@@ -1,0 +1,108 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+
+import {
+  createSessionVisionRuntime,
+  DEFAULT_SESSION_VISION_STATE_OPTIONS,
+} from '../lib/session-vision-runtime.js'
+import { createSessionVisionStateStore } from '../lib/session-vision-state.js'
+
+function ref(id) {
+  return { attachmentId: id, name: `${id}.png`, mediaType: 'image/png' }
+}
+
+function coreStub() {
+  return {
+    collectEventAttachmentRefs(events) {
+      const out = []
+      for (const event of events ?? []) {
+        if (Array.isArray(event?.data?.refs)) out.push(...event.data.refs)
+      }
+      return out
+    },
+    rewriteImageBlocks(messages) {
+      const attachments = []
+      for (const message of messages ?? []) {
+        for (const block of message?.content ?? []) {
+          if (block?.type === 'image' && block.attachment) attachments.push(block.attachment)
+        }
+      }
+      return { messages, attachments }
+    },
+    planToolResultImageShadows() { return [] },
+    planGuardStopShadows() { return [] },
+  }
+}
+
+test('explicit SessionVisionRuntime owns exactly one store and one index', () => {
+  const runtime = createSessionVisionRuntime({ core: coreStub() })
+  assert.ok(runtime.stateStore)
+  assert.ok(runtime.index)
+  assert.equal(Object.isFrozen(runtime), true)
+  assert.deepEqual(
+    runtime.stateStore.options,
+    DEFAULT_SESSION_VISION_STATE_OPTIONS,
+    'closure runtime must preserve the mature core store bounds exactly',
+  )
+})
+
+test('explicit runtime never monkey-patches the state-store lookup API', async () => {
+  const store = createSessionVisionStateStore()
+  const originalLookup = store.lookupAttachment
+  const runtime = createSessionVisionRuntime({
+    core: coreStub(),
+    stateStore: store,
+    readSessionLog: async (session) => ({ supported: true, events: session.events }),
+  })
+  const session = {
+    id: 'no-monkey-patch',
+    events: [{ type: 'user/message', data: { refs: [ref('durable')] } }],
+    surface: { nodes: [0] },
+  }
+
+  assert.equal(runtime.index.lookupAttachment(session, 'durable'), undefined)
+  assert.equal((await runtime.index.resolveAttachment(session, 'durable'))?.attachmentId, 'durable')
+  assert.equal(store.lookupAttachment, originalLookup)
+})
+
+test('explicit runtime remains bound to its own store when another store is constructed later', async () => {
+  const storeA = createSessionVisionStateStore()
+  const runtime = createSessionVisionRuntime({
+    core: coreStub(),
+    stateStore: storeA,
+    readSessionLog: async (session) => ({ supported: true, events: session.events }),
+  })
+  const session = {
+    id: 'session-a',
+    events: [{ type: 'user/message', data: { refs: [ref('owned-by-a')] } }],
+    surface: { nodes: [0] },
+  }
+
+  const storeB = createSessionVisionStateStore()
+  assert.equal(runtime.index.lookupAttachment(session, 'owned-by-a'), undefined)
+  assert.equal((await runtime.index.resolveAttachment(session, 'owned-by-a'))?.attachmentId, 'owned-by-a')
+  assert.equal(storeA.lookupAttachment(session, 'owned-by-a')?.attachmentId, 'owned-by-a')
+  assert.equal(storeB.lookupAttachment(session, 'owned-by-a'), undefined)
+})
+
+test('explicit runtime preserves bounded target-only durable recovery semantics', async () => {
+  const runtime = createSessionVisionRuntime({
+    core: coreStub(),
+    stateOptions: { attachmentMaxEntries: 1 },
+    readSessionLog: async (session) => ({ supported: true, events: session.events }),
+  })
+  const session = {
+    id: 'bounded-recovery',
+    events: [
+      { type: 'user/message', data: { refs: [ref('old')] } },
+      { type: 'user/message', data: { refs: [ref('new')] } },
+    ],
+    surface: { nodes: [0, 1] },
+  }
+
+  runtime.index.recordAttachments(session, [ref('old'), ref('new')])
+  assert.equal(runtime.stateStore.stateStats(session).attachments, 1)
+  assert.equal(runtime.index.lookupAttachment(session, 'old'), undefined)
+  assert.equal((await runtime.index.resolveAttachment(session, 'old'))?.attachmentId, 'old')
+  assert.equal(runtime.stateStore.stateStats(session).attachments, 1)
+})

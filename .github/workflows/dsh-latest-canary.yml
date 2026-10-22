@@ -1,0 +1,145 @@
+name: DSH Release Channel Canary
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/dsh-latest-canary.yml'
+      - 'scripts/dsh-host-contract-smoke.mjs'
+      - 'scripts/host-settings-seam.mjs'
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  release-channel:
+    name: ${{ matrix.channel }}-${{ matrix.dist_tag }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - channel: stable
+            dist_tag: latest
+            settings_mode: auto
+          - channel: next
+            dist_tag: next
+            settings_mode: auto
+          - channel: preview
+            dist_tag: alpha
+            settings_mode: auto
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 11.20.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '22'
+      - name: Resolve DSH release channel
+        shell: bash
+        env:
+          DSH_CHANNEL: ${{ matrix.channel }}
+          DSH_DIST_TAG: ${{ matrix.dist_tag }}
+        run: |
+          set -euo pipefail
+          DSH_VERSION="$(npm view @deepseek-ai/dsh "dist-tags.${DSH_DIST_TAG}")"
+          test -n "$DSH_VERSION"
+          echo "DSH_CHANNEL=$DSH_CHANNEL" >> "$GITHUB_ENV"
+          echo "DSH_DIST_TAG=$DSH_DIST_TAG" >> "$GITHUB_ENV"
+          echo "DSH_VERSION=$DSH_VERSION" >> "$GITHUB_ENV"
+          echo "Testing DSH ${DSH_CHANNEL} channel (${DSH_DIST_TAG}): $DSH_VERSION"
+      - name: Verify DSH release family is published
+        shell: bash
+        run: |
+          set -euo pipefail
+          packages=(
+            '@deepseek-ai/dsh-attachment'
+            '@deepseek-ai/dsh-attachment-local'
+            '@deepseek-ai/dsh-llm'
+            '@deepseek-ai/dsh-llm-deepseek'
+            '@deepseek-ai/dsh-anonymous-user-id'
+            '@deepseek-ai/dsh-session'
+            '@deepseek-ai/dsh-settings'
+            '@deepseek-ai/dsh-tools'
+            '@deepseek-ai/dsh-system-prompt'
+          )
+          missing=()
+          for package in "${packages[@]}"; do
+            published="$(npm view "${package}@${DSH_VERSION}" version 2>/dev/null || true)"
+            if [[ "$published" != "$DSH_VERSION" ]]; then
+              missing+=("$package")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            echo "DSH ${DSH_CHANNEL} root package @deepseek-ai/dsh@$DSH_VERSION is published, but the Host contract package family is incomplete:" >&2
+            for package in "${missing[@]}"; do
+              printf '  - %s@%s\n' "$package" "$DSH_VERSION" >&2
+            done
+            exit 1
+          fi
+      - run: pnpm install --frozen-lockfile
+      - name: Pack plugin
+        run: |
+          mkdir -p tmp-pack
+          pnpm pack --pack-destination tmp-pack
+      - name: Install isolated channel Host fixture
+        shell: node {0}
+        run: |
+          const fs = require('node:fs')
+          const path = require('node:path')
+          const { spawnSync } = require('node:child_process')
+          const tgz = fs.readdirSync('tmp-pack').find((name) => name.endsWith('.tgz'))
+          if (!tgz) throw new Error('packed plugin tarball not found')
+          const tarball = path.resolve('tmp-pack', tgz).replaceAll('\\', '/')
+          const hostDir = path.join(process.env.RUNNER_TEMP, `dvr-${process.env.DSH_CHANNEL}-${process.env.DSH_VERSION}`)
+          fs.rmSync(hostDir, { recursive: true, force: true })
+          fs.mkdirSync(hostDir, { recursive: true })
+          const v = process.env.DSH_VERSION
+          fs.writeFileSync(path.join(hostDir, 'package.json'), JSON.stringify({
+            private: true,
+            type: 'module',
+            packageManager: 'pnpm@11.20.0',
+            dependencies: {
+              'dsh-vision-router': `file:${tarball}`,
+              '@deepseek-ai/dsh-attachment': v,
+              '@deepseek-ai/dsh-attachment-local': v,
+              '@deepseek-ai/dsh-llm': v,
+              '@deepseek-ai/dsh-llm-deepseek': v,
+              '@deepseek-ai/dsh-anonymous-user-id': v,
+              '@deepseek-ai/dsh-session': v,
+              '@deepseek-ai/dsh-settings': v,
+              '@deepseek-ai/dsh-tools': v,
+              '@deepseek-ai/dsh-system-prompt': v,
+              sharp: '0.35.3'
+            }
+          }, null, 2))
+          const installed = spawnSync('pnpm', ['install'], { cwd: hostDir, stdio: 'inherit' })
+          if (installed.status !== 0) process.exit(installed.status ?? 1)
+          fs.appendFileSync(process.env.GITHUB_ENV, `HOST_DIR=${hostDir}\n`)
+      - name: Verify channel Host contract
+        env:
+          EXPECT_BATCH: 'true'
+          EXPECT_DIMENSION: 'true'
+          EXPECT_CURRENT: 'true'
+          EXPECT_SETTINGS_MODE: ${{ matrix.settings_mode }}
+        run: node scripts/dsh-host-contract-smoke.mjs
+      - name: Compatibility investigation hint
+        if: failure()
+        shell: bash
+        run: |
+          {
+            echo "## DSH ${DSH_CHANNEL} compatibility investigation required"
+            echo
+            echo "The canary failed against the @deepseek-ai/dsh ${DSH_VERSION} release family from the ${DSH_DIST_TAG} dist-tag."
+            echo 'This job is intentionally non-gating for normal pull requests. Confirm whether the release family is fully published and then confirm the changed Host capability before changing the supported contract or adding compatibility code.'
+          } >> "$GITHUB_STEP_SUMMARY"
