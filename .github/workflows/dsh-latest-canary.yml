@@ -123,6 +123,17 @@ jobs:
               sharp: '0.35.3'
             }
           }, null, 2))
+          // DSH 0.2.2-alpha.2 removed in-process tool execution: the Host must
+          // ship a tool executor for the contracts to mount. Older release
+          // families have no executor package, so include it only when it is
+          // published at the resolved version.
+          const hostPkgPath = path.join(hostDir, 'package.json')
+          const executorProbe = spawnSync('npm', ['view', `@deepseek-ai/dsh-tool-executor-native@${v}`, 'version'], { stdio: 'pipe' })
+          if (executorProbe.status === 0) {
+            const hostPkg = JSON.parse(fs.readFileSync(hostPkgPath, 'utf8'))
+            hostPkg.dependencies['@deepseek-ai/dsh-tool-executor-native'] = v
+            fs.writeFileSync(hostPkgPath, JSON.stringify(hostPkg, null, 2))
+          }
           const installed = spawnSync('pnpm', ['install'], { cwd: hostDir, stdio: 'inherit' })
           if (installed.status !== 0) process.exit(installed.status ?? 1)
           fs.appendFileSync(process.env.GITHUB_ENV, `HOST_DIR=${hostDir}\n`)
