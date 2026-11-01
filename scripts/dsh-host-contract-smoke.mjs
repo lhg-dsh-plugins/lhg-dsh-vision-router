@@ -233,6 +233,18 @@ if (expectCurrent) {
   const toolsCtx = new Context()
   await toolsCtx.plugin(systemPrompt.default)
   await toolsCtx.plugin(tools.default)
+  // DSH 0.2.2-alpha.2 removed in-process tool execution: a composition that
+  // executes tools must mount a tool executor (native or PTC). Older Host
+  // families ship no executor package, so mount it only when resolvable.
+  let toolExecutorMounted = false
+  try {
+    const executorEntry = requireFromHost.resolve('@deepseek-ai/dsh-tool-executor-native')
+    const executorModule = await import(pathToFileURL(executorEntry).href)
+    await toolsCtx.plugin(executorModule.default ?? executorModule)
+    toolExecutorMounted = true
+  } catch (error) {
+    if (error?.code !== 'MODULE_NOT_FOUND') throw error
+  }
   const toolCapabilities = inspectDshHostCapabilities(toolsCtx)
   assert.equal(toolCapabilities.toolRegistration, true, 'Doctor must recognize current DSH tool registration')
   assert.equal(toolCapabilities.toolExecution, true, 'Doctor must recognize current DSH tool execution')
@@ -249,12 +261,29 @@ if (expectCurrent) {
   const disposeTool = toolsCtx.tools.register(probeTool)
   assert.equal(typeof disposeTool, 'function', 'tool registration must return a disposer')
   assert.equal(toolsCtx.tools.schemas().some((item) => item.name === probeTool.name), true)
-  const toolResult = await toolsCtx.tools.execute({
-    callId: 'vision-router-p0-call',
-    name: probeTool.name,
-    arguments: { text: 'ok' },
-    signal: new AbortController().signal,
-  })
+  let toolResult
+  if (toolExecutorMounted) {
+    // DSH 0.2.2-alpha.2+: execute() takes a raw call batch and settles it
+    // through the mounted executor.
+    const batch = await toolsCtx.tools.execute({
+      calls: [{
+        id: 'vision-router-p0-call',
+        name: probeTool.name,
+        arguments: JSON.stringify({ text: 'ok' }),
+      }],
+      signal: new AbortController().signal,
+    })
+    assert.equal(batch.results.length, 1, 'executor must settle the probe batch')
+    assert.equal(batch.results[0].callId, 'vision-router-p0-call')
+    toolResult = batch.results[0].result
+  } else {
+    toolResult = await toolsCtx.tools.execute({
+      callId: 'vision-router-p0-call',
+      name: probeTool.name,
+      arguments: { text: 'ok' },
+      signal: new AbortController().signal,
+    })
+  }
   assert.deepEqual(toolResult, {
     content: [{ type: 'text', text: 'ok' }],
     isError: false,
