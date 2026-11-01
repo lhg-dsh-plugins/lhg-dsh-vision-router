@@ -178,6 +178,16 @@ async function mount(label) {
   await ctx.plugin(LocalAttachmentStore, { dshHome })
   await ctx.plugin(SystemPrompt)
   await ctx.plugin(ToolRuntime)
+  // DSH 0.2.2-alpha.2 removed in-process tool execution: a composition that
+  // runs an agent must mount a tool executor (native or PTC). Older Host
+  // families ship no executor package, so mount it only when resolvable.
+  try {
+    const executorEntry = hostRequire.resolve('@deepseek-ai/dsh-tool-executor-native')
+    const executorModule = await import(pathToFileURL(executorEntry).href)
+    await ctx.plugin(executorModule.default ?? executorModule)
+  } catch (error) {
+    if (error?.code !== 'MODULE_NOT_FOUND') throw error
+  }
   await ctx.plugin(AgentRegistry)
   if (imageOffloadModule !== undefined) await ctx.plugin(imageOffloadModule)
   // Persistence must outlive AgentLoop teardown so owned write handles can
